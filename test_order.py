@@ -5,16 +5,19 @@ import hashlib
 import base64
 from urllib.parse import urlencode
 import requests
-from dotenv import load_dotenv
+import pandas as pd
 
-# Load API keys from .env
-load_dotenv()
+# ---------------- CONFIG ----------------
+PAIR = "XBTEUR"  # Change if needed
 API_KEY = os.getenv("KRAKEN_API_KEY")
 API_SECRET = os.getenv("KRAKEN_API_SECRET")
-API_BASE = "https://api.kraken.com"
-API_VERSION = "0"
+# ----------------------------------------
 
-FEE_BUFFER = 0.995  # 0.5% buffer for fees
+API_BASE = "https://api.kraken.com"
+
+def require_keys():
+    if not API_KEY or not API_SECRET:
+        raise RuntimeError("KRAKEN_API_KEY and KRAKEN_API_SECRET must be set in environment.")
 
 def _sign(path: str, data: dict, secret: str):
     post_data = urlencode(data)
@@ -23,85 +26,75 @@ def _sign(path: str, data: dict, secret: str):
     mac = hmac.new(base64.b64decode(secret), message, hashlib.sha512)
     return base64.b64encode(mac.digest()).decode()
 
-def private_post(endpoint: str, data: dict = {}):
-    data['nonce'] = int(time.time() * 1000)
-    signature = _sign(f"/{API_VERSION}/private/{endpoint}", data, API_SECRET)
-    headers = {"API-Key": API_KEY, "API-Sign": signature}
-    url = f"{API_BASE}/{API_VERSION}/private/{endpoint}"
-    r = requests.post(url, headers=headers, data=data)
-    return r.json()
-
 def public_get(endpoint: str, params: dict = None):
-    url = f"{API_BASE}/{API_VERSION}/public/{endpoint}"
-    r = requests.get(url, params=params)
+    url = f"{API_BASE}/0/public/{endpoint}"
+    r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
     return r.json()
 
-# 1️⃣ Get account balances
-balances_resp = private_post("Balance")
-balances = balances_resp.get("result", {})
+def private_post(endpoint: str, data: dict):
+    require_keys()
+    path = f"/0/private/{endpoint}"
+    data['nonce'] = int(time.time() * 1000)
+    signature = _sign(path, data, API_SECRET)
+    headers = {
+        "API-Key": API_KEY,
+        "API-Sign": signature,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    url = f"{API_BASE}{path}"
+    r = requests.post(url, headers=headers, data=data, timeout=15)
+    r.raise_for_status()
+    return r.json()
 
-# 2️⃣ Detect available fiat (USD or EUR)
-if 'ZUSD' in balances and float(balances['ZUSD']) > 0:
-    fiat_currency = 'ZUSD'
-    pair_input = 'XBTUSD'
-    available_balance = float(balances['ZUSD'])
-elif 'ZEUR' in balances and float(balances['ZEUR']) > 0:
-    fiat_currency = 'ZEUR'
-    pair_input = 'XBTEUR'
-    available_balance = float(balances['ZEUR'])
-else:
-    print("No USD or EUR balance available. Deposit funds first.")
-    exit()
+def get_balance():
+    resp = private_post("Balance", {})
+    return resp['result']
 
-print(f"Detected balance: {available_balance} {fiat_currency}")
-print(f"Trading pair: {pair_input}")
+def get_min_order_volume(pair):
+    info = public_get("AssetPairs")
+    return float(info['result'][pair]['ordermin'])
 
-# 3️⃣ Fetch minimum order size and actual Kraken pair key
-pair_info = public_get("AssetPairs", {"pair": pair_input})
-pair_key = list(pair_info['result'].keys())[0]  # Kraken internal key
-min_volume = float(pair_info['result'][pair_key]['ordermin'])
-print(f"Minimum BTC volume for {pair_key}: {min_volume}")
+def place_market_order(pair: str, side: str, amount_fiat: float):
+    ticker = public_get("Ticker", {"pair": pair})
+    price = float(ticker['result'][pair]['c'][0])
+    vol = round(amount_fiat / price, 6)
+    min_vol = get_min_order_volume(pair)
+    if vol < min_vol:
+        return None, min_vol
+    order = {
+        "ordertype": "market",
+        "type": side,
+        "volume": str(vol),
+        "pair": pair
+    }
+    resp = private_post("AddOrder", order)
+    return resp, min_vol
 
-# 4️⃣ Get current BTC price
-ticker = public_get("Ticker", {"pair": pair_input})
-price = float(ticker['result'][pair_key]['c'][0])
-print(f"Current BTC price: {price}")
+def main():
+    print("Starting test order...")
 
-# 5️⃣ Calculate BTC volume with fee buffer
-volume = round(available_balance * FEE_BUFFER / price, 6)
-if volume < min_volume:
-    print(f"Balance too low for minimum order ({min_volume} BTC).")
-    exit()
+    balances = get_balance()
+    fiat_balance = float(balances.get("ZEUR", 0))
+    btc_balance = float(balances.get("XXBT", 0))
+    print(f"Detected balance: {fiat_balance} ZEUR, {btc_balance} BTC")
 
-print(f"Placing market BUY for {volume} BTC (~{available_balance} {fiat_currency})")
+    # Use all available fiat for BUY
+    resp, min_vol = place_market_order(PAIR, 'buy', fiat_balance)
+    if resp:
+        print("BUY order executed:", resp)
+        # Calculate bought BTC amount
+        vol_bought = float(resp['descr']['order'].split()[1])
+        # Immediately sell the same amount
+        btc_price = float(public_get("Ticker", {"pair": PAIR})['result'][PAIR]['c'][0])
+        sell_fiat = vol_bought * btc_price
+        sell_resp, _ = place_market_order(PAIR, 'sell', sell_fiat)
+        if sell_resp:
+            print("SELL order executed:", sell_resp)
+        else:
+            print("SELL order failed: balance too low")
+    else:
+        print(f"BUY order skipped: balance too low for minimum ({min_vol} BTC)")
 
-# 6️⃣ Place BUY order
-buy_order = {
-    "ordertype": "market",
-    "type": "buy",
-    "volume": str(volume),
-    "pair": pair_key
-}
-
-buy_resp = private_post("AddOrder", buy_order)
-if buy_resp['error']:
-    print("BUY order rejected:", buy_resp['error'])
-    exit()
-else:
-    print("BUY order executed:", buy_resp['result'])
-
-# 7️⃣ Immediately place SELL order
-print("Placing immediate SELL order to test...")
-sell_order = {
-    "ordertype": "market",
-    "type": "sell",
-    "volume": str(volume),
-    "pair": pair_key
-}
-
-sell_resp = private_post("AddOrder", sell_order)
-if sell_resp['error']:
-    print("SELL order rejected:", sell_resp['error'])
-else:
-    print("SELL order executed:", sell_resp['result'])
+if __name__ == "__main__":
+    main()
