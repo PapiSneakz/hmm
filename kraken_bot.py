@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()  # loads variables from .env into os.environ
+
 import os
 import time
 import hmac
