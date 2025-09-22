@@ -3,23 +3,21 @@ import time
 import hmac
 import hashlib
 import base64
-import json
 from urllib.parse import urlencode
-
 import requests
 import pandas as pd
 
-# ------------------ CONFIG ------------------
-PAIR = "XBTEUR"             # Your trading pair
+# ---------------- CONFIG ----------------
+PAIR = "XBTEUR"             # Trading pair
+TRADE_EUR = 30.0            # Max euros per trade
 SHORT_SMA = 10
 LONG_SMA = 30
-POLL_INTERVAL = 30          # seconds
+POLL_INTERVAL = 30          # seconds between checks
 LAST_ACTION_FILE = "last_action.txt"
 
 API_KEY = os.getenv("KRAKEN_API_KEY")
 API_SECRET = os.getenv("KRAKEN_API_SECRET")
-
-# -------------------------------------------------
+# ----------------------------------------
 
 API_BASE = "https://api.kraken.com"
 
@@ -82,10 +80,10 @@ def get_min_order_volume(pair):
     info = public_get("AssetPairs")
     return float(info['result'][pair]['ordermin'])
 
-def place_market_order(pair: str, side: str, usd_amount: float):
-    price_resp = public_get("Ticker", {"pair": pair})
-    price = float(price_resp['result'][pair]['c'][0])
-    vol = round(usd_amount / price, 6)
+def place_market_order(pair: str, side: str, eur_amount: float):
+    ticker = public_get("Ticker", {"pair": pair})
+    price = float(ticker['result'][pair]['c'][0])
+    vol = round(eur_amount / price, 6)
     min_vol = get_min_order_volume(pair)
     if vol < min_vol:
         return None, min_vol
@@ -109,49 +107,50 @@ def save_last_action(action):
         f.write(action)
 
 def main():
-    print("Running LIVE Kraken bot with logging and fee-safe orders...")
+    print("Running LIVE Kraken bot with max 30 EUR per trade...")
     last_action = load_last_action()
 
     while True:
         try:
             df = fetch_ohlc(PAIR)
             signal = generate_signal(df)
-            print(time.strftime("%Y-%m-%d %H:%M:%S"), "| Signal:", signal)
-
             balances = get_balance()
             fiat_balance = float(balances.get("ZEUR", 0))
             btc_balance = float(balances.get("XXBT", 0))
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
-            min_order = get_min_order_volume(PAIR)
+            print(f"{timestamp} | Signal: {signal} | Fiat: {fiat_balance} EUR | BTC: {btc_balance}")
 
             # ----- BUY -----
-            if signal == 'buy' and last_action != 'buy':
-                usd_amount = fiat_balance
-                resp, min_vol = place_market_order(PAIR, 'buy', usd_amount)
+            if signal == 'buy' and last_action != 'buy' and fiat_balance > 0:
+                trade_amount = min(fiat_balance, TRADE_EUR)
+                resp, min_vol = place_market_order(PAIR, 'buy', trade_amount)
                 if resp:
-                    print("BUY order executed:", resp)
+                    print(f"{timestamp} | BUY executed:", resp)
                     last_action = 'buy'
                     save_last_action(last_action)
                 else:
-                    print(f"Balance too low for minimum order ({min_vol} BTC). Skipping BUY order.")
+                    print(f"{timestamp} | Balance too low for minimum order ({min_vol} BTC). Skipping BUY.")
 
             # ----- SELL -----
-            elif signal == 'sell' and last_action == 'buy':
-                resp, min_vol = place_market_order(PAIR, 'sell', btc_balance * df['close'].iloc[-1])
+            elif signal == 'sell' and last_action == 'buy' and btc_balance > 0:
+                btc_price = float(public_get("Ticker", {"pair": PAIR})['result'][PAIR]['c'][0])
+                trade_amount = min(btc_balance * btc_price, TRADE_EUR)
+                resp, min_vol = place_market_order(PAIR, 'sell', trade_amount)
                 if resp:
-                    print("SELL order executed:", resp)
+                    print(f"{timestamp} | SELL executed:", resp)
                     last_action = 'sell'
                     save_last_action(last_action)
                 else:
-                    print(f"Balance too low for minimum order ({min_vol} BTC). Skipping SELL order.")
+                    print(f"{timestamp} | Balance too low for minimum order ({min_vol} BTC). Skipping SELL.")
+
             else:
-                print("No trade executed. Last action:", last_action)
+                print(f"{timestamp} | No trade executed. Last action: {last_action}")
 
         except Exception as e:
-            print("Error in main loop:", e)
+            print(f"{timestamp} | Error in main loop:", e)
 
         time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
     main()
-
