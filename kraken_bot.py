@@ -3,22 +3,25 @@ import time
 import hmac
 import hashlib
 import base64
+import json
 from urllib.parse import urlencode
+
 import requests
 import pandas as pd
-import numpy as np
-from dotenv import load_dotenv
 
-load_dotenv()
-
-API_BASE = "https://api.kraken.com"
+# ------------------ CONFIG ------------------
+PAIR = "XBTEUR"             # Your trading pair
 SHORT_SMA = 10
 LONG_SMA = 30
-POLL_INTERVAL = 30  # seconds
-FEE_BUFFER = 0.995  # 0.5% buffer for fees
+POLL_INTERVAL = 30          # seconds
+LAST_ACTION_FILE = "last_action.txt"
 
 API_KEY = os.getenv("KRAKEN_API_KEY")
 API_SECRET = os.getenv("KRAKEN_API_SECRET")
+
+# -------------------------------------------------
+
+API_BASE = "https://api.kraken.com"
 
 def require_keys():
     if not API_KEY or not API_SECRET:
@@ -37,39 +40,27 @@ def public_get(endpoint: str, params: dict = None):
     r.raise_for_status()
     return r.json()
 
-def private_post(endpoint: str, data: dict = {}):
+def private_post(endpoint: str, data: dict):
     require_keys()
-    data['nonce'] = int(time.time() * 1000)
     path = f"/0/private/{endpoint}"
+    data['nonce'] = int(time.time() * 1000)
     signature = _sign(path, data, API_SECRET)
-    headers = {"API-Key": API_KEY, "API-Sign": signature}
-    url = f"{API_BASE}/0/private/{endpoint}"
+    headers = {
+        "API-Key": API_KEY,
+        "API-Sign": signature,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    url = f"{API_BASE}{path}"
     r = requests.post(url, headers=headers, data=data, timeout=15)
     r.raise_for_status()
     return r.json()
 
-def get_fiat_balance():
-    balances = private_post("Balance").get("result", {})
-    if 'ZUSD' in balances and float(balances['ZUSD']) > 0:
-        return 'ZUSD', float(balances['ZUSD']), 'XBTUSD'
-    elif 'ZEUR' in balances and float(balances['ZEUR']) > 0:
-        return 'ZEUR', float(balances['ZEUR']), 'XBTEUR'
-    else:
-        return None, 0, None
-
-def get_pair_info(pair_input):
-    pair_info = public_get("AssetPairs", {"pair": pair_input})
-    pair_key = list(pair_info['result'].keys())[0]
-    min_volume = float(pair_info['result'][pair_key]['ordermin'])
-    return pair_key, min_volume
-
-def fetch_ohlc(pair_input: str, interval: int = 1, count: int = 200):
-    pair_key, _ = get_pair_info(pair_input)
-    resp = public_get("OHLC", {"pair": pair_key, "interval": interval})
-    data = resp['result'][pair_key]
+def fetch_ohlc(pair: str, interval: int = 1, count: int = 200):
+    resp = public_get("OHLC", {"pair": pair, "interval": interval})
+    data = resp['result'][pair]
     df = pd.DataFrame(data, columns=["time","open","high","low","close","vwap","volume","count"])
     df['close'] = df['close'].astype(float)
-    return df.tail(count), pair_key
+    return df.tail(count)
 
 def generate_signal(df: pd.DataFrame):
     df['sma_short'] = df['close'].rolling(window=SHORT_SMA).mean()
@@ -83,63 +74,78 @@ def generate_signal(df: pd.DataFrame):
         return 'sell'
     return None
 
-def place_market_order(side: str, pair_input: str):
-    fiat_code, balance, _ = get_fiat_balance()
-    if not fiat_code:
-        print("No USD or EUR balance available for trading.")
-        return None
+def get_balance():
+    resp = private_post("Balance", {})
+    return resp['result']
 
-    pair_key, min_volume = get_pair_info(pair_input)
-    price_resp = public_get("Ticker", {"pair": pair_input})
-    price = float(price_resp['result'][pair_key]['c'][0])
-    volume = round(balance * FEE_BUFFER / price, 6)
+def get_min_order_volume(pair):
+    info = public_get("AssetPairs")
+    return float(info['result'][pair]['ordermin'])
 
-    if volume < min_volume:
-        print(f"Balance too low for minimum order ({min_volume} BTC). Skipping {side.upper()} order.")
-        return None
-
+def place_market_order(pair: str, side: str, usd_amount: float):
+    price_resp = public_get("Ticker", {"pair": pair})
+    price = float(price_resp['result'][pair]['c'][0])
+    vol = round(usd_amount / price, 6)
+    min_vol = get_min_order_volume(pair)
+    if vol < min_vol:
+        return None, min_vol
     order = {
         "ordertype": "market",
         "type": side,
-        "volume": str(volume),
-        "pair": pair_key
+        "volume": str(vol),
+        "pair": pair
     }
-
     resp = private_post("AddOrder", order)
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    if resp['error']:
-        print(f"{timestamp} | {side.upper()} order rejected:", resp['error'])
-        return None
-    else:
-        descr = resp['result'].get('descr', {}).get('order', '')
-        txid = resp['result'].get('txid', [])
-        print(f"{timestamp} | {side.upper()} executed: {volume} BTC (~{round(volume*price, 2)} {fiat_code}) | txid: {txid} | {descr}")
-        return resp['result']
+    return resp, min_vol
+
+def load_last_action():
+    if os.path.exists(LAST_ACTION_FILE):
+        with open(LAST_ACTION_FILE, "r") as f:
+            return f.read().strip()
+    return None
+
+def save_last_action(action):
+    with open(LAST_ACTION_FILE, "w") as f:
+        f.write(action)
 
 def main():
-    last_action = None
-    print("Running LIVE Kraken bot with logging, internal pair keys, and fee-safe orders...")
+    print("Running LIVE Kraken bot with logging and fee-safe orders...")
+    last_action = load_last_action()
+
     while True:
         try:
-            fiat_code, balance, pair_input = get_fiat_balance()
-            if not fiat_code:
-                print("No USD or EUR balance available. Skipping iteration.")
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            df, pair_key = fetch_ohlc(pair_input)
+            df = fetch_ohlc(PAIR)
             signal = generate_signal(df)
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            print(f"{timestamp} | Signal: {signal}")
+            print(time.strftime("%Y-%m-%d %H:%M:%S"), "| Signal:", signal)
 
+            balances = get_balance()
+            fiat_balance = float(balances.get("ZEUR", 0))
+            btc_balance = float(balances.get("XXBT", 0))
+
+            min_order = get_min_order_volume(PAIR)
+
+            # ----- BUY -----
             if signal == 'buy' and last_action != 'buy':
-                place_market_order('buy', pair_input)
-                last_action = 'buy'
+                usd_amount = fiat_balance
+                resp, min_vol = place_market_order(PAIR, 'buy', usd_amount)
+                if resp:
+                    print("BUY order executed:", resp)
+                    last_action = 'buy'
+                    save_last_action(last_action)
+                else:
+                    print(f"Balance too low for minimum order ({min_vol} BTC). Skipping BUY order.")
+
+            # ----- SELL -----
             elif signal == 'sell' and last_action == 'buy':
-                place_market_order('sell', pair_input)
-                last_action = 'sell'
+                resp, min_vol = place_market_order(PAIR, 'sell', btc_balance * df['close'].iloc[-1])
+                if resp:
+                    print("SELL order executed:", resp)
+                    last_action = 'sell'
+                    save_last_action(last_action)
+                else:
+                    print(f"Balance too low for minimum order ({min_vol} BTC). Skipping SELL order.")
             else:
-                print(f"{timestamp} | No trade executed. Last action: {last_action}")
+                print("No trade executed. Last action:", last_action)
 
         except Exception as e:
             print("Error in main loop:", e)
@@ -148,3 +154,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
