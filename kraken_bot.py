@@ -8,7 +8,7 @@ import requests
 import pandas as pd
 
 # ---------------- CONFIG ----------------
-PAIR = "XBTEUR"             # Trading pair
+PAIR = "XXBTZEUR"          # Correct Kraken pair for BTC/EUR
 TRADE_EUR = 30.0            # Max euros per trade
 SHORT_SMA = 10
 LONG_SMA = 30
@@ -111,13 +111,13 @@ def main():
     last_action = load_last_action()
 
     while True:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         try:
             df = fetch_ohlc(PAIR)
             signal = generate_signal(df)
             balances = get_balance()
             fiat_balance = float(balances.get("ZEUR", 0))
             btc_balance = float(balances.get("XXBT", 0))
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
             print(f"{timestamp} | Signal: {signal} | Fiat: {fiat_balance} EUR | BTC: {btc_balance}")
 
