@@ -12,10 +12,10 @@ import pandas as pd
 
 # ---------------- CONFIG ----------------
 PAIR = "XXBTZEUR"          # Correct Kraken pair for BTC/EUR
-TRADE_EUR = 30.0            # Max euros per trade
+TRADE_EUR = 30.0           # Target euros per trade (max)
 SHORT_SMA = 10
 LONG_SMA = 30
-POLL_INTERVAL = 30          # seconds between checks
+POLL_INTERVAL = 30         # seconds between checks
 LAST_ACTION_FILE = "last_action.txt"
 
 API_KEY = os.getenv("KRAKEN_API_KEY")
@@ -88,8 +88,19 @@ def place_market_order(pair: str, side: str, eur_amount: float):
     price = float(ticker['result'][pair]['c'][0])
     vol = round(eur_amount / price, 6)
     min_vol = get_min_order_volume(pair)
+
+    # If volume is below minimum, try to bump to minimum if funds allow
     if vol < min_vol:
-        return None, min_vol
+        if side == "buy":
+            needed_eur = price * min_vol
+            fiat_balance = float(get_balance().get("ZEUR", 0))
+            if needed_eur > fiat_balance:
+                return None, min_vol  # not enough to meet minimum
+            vol = min_vol
+        else:
+            # Selling below minimum not allowed
+            return None, min_vol
+
     order = {
         "ordertype": "market",
         "type": side,
@@ -110,7 +121,7 @@ def save_last_action(action):
         f.write(action)
 
 def main():
-    print("Running LIVE Kraken bot with max 30 EUR per trade...")
+    print("Running LIVE Kraken bot with target 30 EUR per trade...")
     last_action = load_last_action()
 
     while True:
@@ -122,7 +133,7 @@ def main():
             fiat_balance = float(balances.get("ZEUR", 0))
             btc_balance = float(balances.get("XXBT", 0))
 
-            print(f"{timestamp} | Signal: {signal} | Fiat: {fiat_balance} EUR | BTC: {btc_balance}")
+            print(f"{timestamp} | Signal: {signal} | Fiat: {fiat_balance:.4f} EUR | BTC: {btc_balance:.6f}")
 
             # ----- BUY -----
             if signal == 'buy' and last_action != 'buy' and fiat_balance > 0:
@@ -133,19 +144,20 @@ def main():
                     last_action = 'buy'
                     save_last_action(last_action)
                 else:
-                    print(f"{timestamp} | Balance too low for minimum order ({min_vol} BTC). Skipping BUY.")
+                    print(f"{timestamp} | Not enough balance for minimum order ({min_vol} BTC). Skipping BUY.")
 
             # ----- SELL -----
             elif signal == 'sell' and last_action == 'buy' and btc_balance > 0:
                 btc_price = float(public_get("Ticker", {"pair": PAIR})['result'][PAIR]['c'][0])
-                trade_amount = min(btc_balance * btc_price, TRADE_EUR)
+                eur_equivalent = btc_balance * btc_price
+                trade_amount = min(eur_equivalent, TRADE_EUR)
                 resp, min_vol = place_market_order(PAIR, 'sell', trade_amount)
                 if resp:
                     print(f"{timestamp} | SELL executed:", resp)
                     last_action = 'sell'
                     save_last_action(last_action)
                 else:
-                    print(f"{timestamp} | Balance too low for minimum order ({min_vol} BTC). Skipping SELL.")
+                    print(f"{timestamp} | Not enough BTC for minimum order ({min_vol} BTC). Skipping SELL.")
 
             else:
                 print(f"{timestamp} | No trade executed. Last action: {last_action}")
