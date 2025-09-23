@@ -1,6 +1,6 @@
 # kraken_bot.py
 from dotenv import load_dotenv
-load_dotenv()  # loads variables from .env into os.environ
+load_dotenv()
 import os
 import time
 import hmac
@@ -12,19 +12,17 @@ import pandas as pd
 import json
 
 # ---------------- CONFIG (Balanced Profile) ----------------
-ASSETS = ["BTC", "LTC", "DOGE"]  # base tickers to monitor
-QUOTE = "EUR"                    # quote currency
+ASSETS = ["BTC", "LTC", "DOGE"]
+QUOTE = "EUR"
 
-TRADE_EUR = 30.0                 # Target euros per trade (max total per trade decision)
+TRADE_EUR = 30.0  # Max EUR per trade per coin
 
-# Balanced scalping profile
-SHORT_EMA = 5                    # fast EMA
-LONG_EMA = 20                    # slow EMA
-OHLC_INTERVAL = 1                # use 1-minute candles
-OHLC_COUNT = 200                 # number of candles to fetch per asset
+SHORT_EMA = 5
+LONG_EMA = 20
+OHLC_INTERVAL = 1
+OHLC_COUNT = 200
 
-AGREE_THRESHOLD = 2              # majority agreement (2 of 3 assets)
-POLL_INTERVAL = 30               # seconds between checks
+POLL_INTERVAL = 30  # seconds between checks
 
 LAST_ACTION_FILE = "last_action.json"
 
@@ -34,11 +32,9 @@ API_SECRET = os.getenv("KRAKEN_API_SECRET")
 
 API_BASE = "https://api.kraken.com"
 
-
 def require_keys():
     if not API_KEY or not API_SECRET:
         raise RuntimeError("KRAKEN_API_KEY and KRAKEN_API_SECRET must be set in environment.")
-
 
 def _sign(path: str, data: dict, secret: str):
     post_data = urlencode(data)
@@ -47,13 +43,11 @@ def _sign(path: str, data: dict, secret: str):
     mac = hmac.new(base64.b64decode(secret), message, hashlib.sha512)
     return base64.b64encode(mac.digest()).decode()
 
-
 def public_get(endpoint: str, params: dict = None):
     url = f"{API_BASE}/0/public/{endpoint}"
     r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
     return r.json()
-
 
 def private_post(endpoint: str, data: dict):
     require_keys()
@@ -70,7 +64,6 @@ def private_post(endpoint: str, data: dict):
     r.raise_for_status()
     return r.json()
 
-
 def fetch_ohlc(pair: str, interval: int = OHLC_INTERVAL, count: int = OHLC_COUNT):
     resp = public_get("OHLC", {"pair": pair, "interval": interval})
     result = resp.get('result', {})
@@ -82,16 +75,11 @@ def fetch_ohlc(pair: str, interval: int = OHLC_INTERVAL, count: int = OHLC_COUNT
         break
     if data is None:
         raise RuntimeError(f"No OHLC data returned for {pair}")
-    df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "vwap", "volume", "count"])
+    df = pd.DataFrame(data, columns=["time","open","high","low","close","vwap","volume","count"])
     df['close'] = df['close'].astype(float)
     return df.tail(count)
 
-
 def generate_scalp_signal(df: pd.DataFrame):
-    """
-    Balanced scalping signal using EMA crossover (5 vs 20).
-    Returns 'buy', 'sell', or None.
-    """
     if len(df) < LONG_EMA + 2:
         return None
     df = df.copy()
@@ -99,23 +87,19 @@ def generate_scalp_signal(df: pd.DataFrame):
     df['ema_long'] = df['close'].ewm(span=LONG_EMA, adjust=False).mean()
     prev = df.iloc[-2]
     last = df.iloc[-1]
-
     if prev['ema_short'] <= prev['ema_long'] and last['ema_short'] > last['ema_long']:
         return 'buy'
     if prev['ema_short'] >= prev['ema_long'] and last['ema_short'] < last['ema_long']:
         return 'sell'
     return None
 
-
 def get_balance():
     resp = private_post("Balance", {})
     return resp['result']
 
-
 def get_all_assetpairs():
     resp = public_get("AssetPairs")
     return resp['result']
-
 
 def resolve_pairs(bases, quote=QUOTE):
     pairs_info = get_all_assetpairs()
@@ -146,11 +130,9 @@ def resolve_pairs(bases, quote=QUOTE):
         }
     return resolved
 
-
 def get_min_order_volume(pair):
     info = public_get("AssetPairs")
     return float(info['result'][pair]['ordermin'])
-
 
 def place_market_order(pair: str, side: str, eur_amount: float):
     ticker = public_get("Ticker", {"pair": pair})
@@ -162,21 +144,18 @@ def place_market_order(pair: str, side: str, eur_amount: float):
         price = float(v['c'][0])
         break
     if price is None:
-        raise RuntimeError(f"Could not fetch ticker price for pair {pair}")
-
+        raise RuntimeError(f"Could not fetch ticker price for {pair}")
     vol = round(eur_amount / price, 8)
     min_vol = get_min_order_volume(pair)
-
     if vol < min_vol:
         if side == "buy":
             needed_eur = price * min_vol
-            fiat_balance = float(get_balance().get("ZEUR", 0))
+            fiat_balance = float(get_balance().get("Z" + QUOTE, 0))
             if needed_eur > fiat_balance:
                 return None, min_vol
             vol = min_vol
         else:
             return None, min_vol
-
     order = {
         "ordertype": "market",
         "type": side,
@@ -185,7 +164,6 @@ def place_market_order(pair: str, side: str, eur_amount: float):
     }
     resp = private_post("AddOrder", order)
     return resp, min_vol
-
 
 def load_last_action():
     if os.path.exists(LAST_ACTION_FILE):
@@ -196,112 +174,86 @@ def load_last_action():
                 return {}
     return {}
 
-
 def save_last_action(actions_dict):
     with open(LAST_ACTION_FILE, "w") as f:
         json.dump(actions_dict, f)
 
+def get_price(pair):
+    ticker = public_get("Ticker", {"pair": pair})
+    result = ticker.get('result', {})
+    for k, v in result.items():
+        if k == 'last':
+            continue
+        return float(v['c'][0])
+    return 0
 
 def main():
-    print("Running MULTI-asset Kraken scalping bot (Balanced Profile: 5/20 EMA, 1m candles, threshold=2)...")
+    print("Running PER-COIN scalping bot (Balanced Profile: 5/20 EMA, 1m candles)...")
     last_action = load_last_action()
     try:
         resolved = resolve_pairs(ASSETS, QUOTE)
     except Exception as e:
         print("Error resolving asset pairs:", e)
         return
-
     print("Resolved pairs:")
     for base, info in resolved.items():
         print(f"  {base} -> pair {info['pair']} (base asset code: {info['base_asset']})")
-
     while True:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         try:
             balances = get_balance()
-            fiat_balance = float(balances.get("Z" + QUOTE, balances.get(QUOTE, 0)) or 0)
-            per_asset_balances = {}
-            for base, info in resolved.items():
-                base_asset_code = info['base_asset']
-                per_asset_balances[base] = float(balances.get(base_asset_code, 0) or 0)
+            fiat_balance = float(balances.get("Z" + QUOTE, 0) or 0)
+            per_asset_balances = {base: float(balances.get(info['base_asset'], 0) or 0)
+                                  for base, info in resolved.items()}
 
             asset_signals = {}
             for base, info in resolved.items():
-                pair = info['pair']
-                df = fetch_ohlc(pair, interval=OHLC_INTERVAL, count=OHLC_COUNT)
-                signal = generate_scalp_signal(df)
-                asset_signals[base] = signal
+                df = fetch_ohlc(info['pair'], interval=OHLC_INTERVAL, count=OHLC_COUNT)
+                asset_signals[base] = generate_scalp_signal(df)
 
-            buys = [b for b, s in asset_signals.items() if s == 'buy']
-            sells = [b for b, s in asset_signals.items() if s == 'sell']
-
-            print(f"{timestamp} | Signals: {asset_signals} | Fiat: {fiat_balance:.4f} {QUOTE} | Asset balances: {per_asset_balances}")
+            print(f"{timestamp} | Signals: {asset_signals} | Fiat: {fiat_balance:.4f} {QUOTE} | Balances: {per_asset_balances}")
 
             executed_any = False
 
-            # BUY
-            if len(buys) >= AGREE_THRESHOLD and fiat_balance > 0:
-                eur_per_asset = min(TRADE_EUR / max(1, len(buys)), fiat_balance / max(1, len(buys)))
-                print(f"{timestamp} | Majority BUY ({len(buys)}). Attempting: {buys} each {eur_per_asset:.2f} {QUOTE}")
-                for base in buys:
-                    if last_action.get(base) == 'buy':
-                        print(f"{timestamp} | {base}: last action already BUY. Skipping.")
-                        continue
-                    pair = resolved[base]['pair']
-                    resp, min_vol = place_market_order(pair, 'buy', eur_per_asset)
+            for base, signal in asset_signals.items():
+                pair = resolved[base]['pair']
+                balance = per_asset_balances.get(base, 0)
+                last = last_action.get(base, None)
+
+                # BUY
+                if signal == 'buy' and last != 'buy' and fiat_balance > 0:
+                    eur_amount = min(TRADE_EUR, fiat_balance)
+                    resp, min_vol = place_market_order(pair, 'buy', eur_amount)
                     if resp:
                         print(f"{timestamp} | BUY {base} executed:", resp)
                         last_action[base] = 'buy'
+                        fiat_balance -= eur_amount
                         executed_any = True
                     else:
-                        print(f"{timestamp} | Not enough balance for minimum order ({min_vol} {base}). Skipping.")
-                if executed_any:
-                    save_last_action(last_action)
+                        print(f"{timestamp} | Not enough balance for min order ({min_vol} {base}). Skipping BUY.")
 
-            # SELL
-            elif len(sells) >= AGREE_THRESHOLD:
-                print(f"{timestamp} | Majority SELL ({len(sells)}). Attempting: {sells}")
-                for base in sells:
-                    base_bal = per_asset_balances.get(base, 0)
-                    if base_bal <= 0:
-                        print(f"{timestamp} | {base}: no balance to sell. Skipping.")
-                        continue
-                    if last_action.get(base) == 'sell':
-                        print(f"{timestamp} | {base}: last action already SELL. Skipping.")
-                        continue
-
-                    pair = resolved[base]['pair']
-                    ticker = public_get("Ticker", {"pair": pair})
-                    result = ticker.get('result', {})
-                    price = None
-                    for k, v in result.items():
-                        if k == 'last':
-                            continue
-                        price = float(v['c'][0])
-                        break
-                    if price is None:
-                        print(f"{timestamp} | Could not fetch price for {base}. Skipping.")
-                        continue
-                    eur_equivalent = base_bal * price
-                    eur_to_sell = min(eur_equivalent, TRADE_EUR / max(1, len(sells)))
-                    resp, min_vol = place_market_order(pair, 'sell', eur_to_sell)
+                # SELL
+                elif signal == 'sell' and last != 'sell' and balance > 0:
+                    price = get_price(pair)
+                    eur_equivalent = balance * price
+                    eur_amount = min(eur_equivalent, TRADE_EUR)
+                    resp, min_vol = place_market_order(pair, 'sell', eur_amount)
                     if resp:
                         print(f"{timestamp} | SELL {base} executed:", resp)
                         last_action[base] = 'sell'
                         executed_any = True
                     else:
-                        print(f"{timestamp} | Not enough for minimum order ({min_vol} {base}). Skipping.")
-                if executed_any:
-                    save_last_action(last_action)
+                        print(f"{timestamp} | Not enough for minimum order ({min_vol} {base}). Skipping SELL.")
 
+            if executed_any:
+                save_last_action(last_action)
             else:
-                print(f"{timestamp} | No majority signal. Last actions: {last_action}")
+                print(f"{timestamp} | No trades executed. Last actions: {last_action}")
 
         except Exception as e:
             print(f"{timestamp} | Error in main loop:", e)
 
         time.sleep(POLL_INTERVAL)
-
 
 if __name__ == "__main__":
     main()
