@@ -16,6 +16,7 @@ ASSETS = ["BTC", "LTC", "DOGE"]
 QUOTE = "EUR"
 
 TRADE_EUR = 30.0  # Max EUR per trade per coin
+MIN_PROFIT = 0.005  # Minimum profit threshold: 0.5% (~covers fees)
 
 SHORT_EMA = 5
 LONG_EMA = 20
@@ -134,17 +135,19 @@ def get_min_order_volume(pair):
     info = public_get("AssetPairs")
     return float(info['result'][pair]['ordermin'])
 
-def place_market_order(pair: str, side: str, eur_amount: float):
+def get_price(pair):
     ticker = public_get("Ticker", {"pair": pair})
     result = ticker.get('result', {})
-    price = None
     for k, v in result.items():
         if k == 'last':
             continue
-        price = float(v['c'][0])
-        break
-    if price is None:
-        raise RuntimeError(f"Could not fetch ticker price for {pair}")
+        return float(v['c'][0])
+    return 0
+
+def place_market_order(pair: str, side: str, eur_amount: float):
+    price = get_price(pair)
+    if price == 0:
+        return None, 0
     vol = round(eur_amount / price, 8)
     min_vol = get_min_order_volume(pair)
     if vol < min_vol:
@@ -178,17 +181,8 @@ def save_last_action(actions_dict):
     with open(LAST_ACTION_FILE, "w") as f:
         json.dump(actions_dict, f)
 
-def get_price(pair):
-    ticker = public_get("Ticker", {"pair": pair})
-    result = ticker.get('result', {})
-    for k, v in result.items():
-        if k == 'last':
-            continue
-        return float(v['c'][0])
-    return 0
-
 def main():
-    print("Running PER-COIN scalping bot (Balanced Profile: 5/20 EMA, 1m candles)...")
+    print("Running PER-COIN scalping bot (Balanced Profile: 5/20 EMA, 1m candles) with min profit threshold...")
     last_action = load_last_action()
     try:
         resolved = resolve_pairs(ASSETS, QUOTE)
@@ -198,6 +192,7 @@ def main():
     print("Resolved pairs:")
     for base, info in resolved.items():
         print(f"  {base} -> pair {info['pair']} (base asset code: {info['base_asset']})")
+
     while True:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         try:
@@ -218,32 +213,38 @@ def main():
             for base, signal in asset_signals.items():
                 pair = resolved[base]['pair']
                 balance = per_asset_balances.get(base, 0)
-                last = last_action.get(base, None)
+                last = last_action.get(base, {})
 
                 # BUY
-                if signal == 'buy' and last != 'buy' and fiat_balance > 0:
+                if signal == 'buy' and (last.get('side') != 'buy') and fiat_balance > 0:
                     eur_amount = min(TRADE_EUR, fiat_balance)
                     resp, min_vol = place_market_order(pair, 'buy', eur_amount)
                     if resp:
-                        print(f"{timestamp} | BUY {base} executed:", resp)
-                        last_action[base] = 'buy'
+                        price = get_price(pair)
+                        last_action[base] = {"side": "buy", "price": price}
                         fiat_balance -= eur_amount
                         executed_any = True
+                        print(f"{timestamp} | BUY {base} executed at {price}:", resp)
                     else:
                         print(f"{timestamp} | Not enough balance for min order ({min_vol} {base}). Skipping BUY.")
 
                 # SELL
-                elif signal == 'sell' and last != 'sell' and balance > 0:
+                elif signal == 'sell' and last.get('side') == 'buy' and balance > 0:
+                    buy_price = last['price']
                     price = get_price(pair)
-                    eur_equivalent = balance * price
-                    eur_amount = min(eur_equivalent, TRADE_EUR)
-                    resp, min_vol = place_market_order(pair, 'sell', eur_amount)
-                    if resp:
-                        print(f"{timestamp} | SELL {base} executed:", resp)
-                        last_action[base] = 'sell'
-                        executed_any = True
+                    target_price = buy_price * (1 + MIN_PROFIT)
+                    if price >= target_price:
+                        eur_equivalent = balance * price
+                        eur_amount = min(eur_equivalent, TRADE_EUR)
+                        resp, min_vol = place_market_order(pair, 'sell', eur_amount)
+                        if resp:
+                            last_action[base] = {"side": "sell"}
+                            executed_any = True
+                            print(f"{timestamp} | SELL {base} executed at {price}:", resp)
+                        else:
+                            print(f"{timestamp} | Not enough for min order ({min_vol} {base}). Skipping SELL.")
                     else:
-                        print(f"{timestamp} | Not enough for minimum order ({min_vol} {base}). Skipping SELL.")
+                        print(f"{timestamp} | {base} sell skipped: current {price:.6f} < target {target_price:.6f}")
 
             if executed_any:
                 save_last_action(last_action)
