@@ -11,12 +11,12 @@ import requests
 import pandas as pd
 import json
 
-# ---------------- CONFIG (Balanced Profile) ----------------
+# ---------------- CONFIG ----------------
 ASSETS = ["BTC", "LTC", "DOGE"]
 QUOTE = "EUR"
 
 TRADE_EUR = 50.0           # Max EUR per trade per coin
-MIN_PROFIT = 0.005         # Minimum profit threshold: 0.5% (~covers fees)
+MIN_PROFIT = 0.005         # Minimum profit threshold (~0.5%)
 
 SHORT_EMA = 5
 LONG_EMA = 20
@@ -33,10 +33,9 @@ API_SECRET = os.getenv("KRAKEN_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# -----------------------------------------------------------
 API_BASE = "https://api.kraken.com"
 
-# ------------------- Telegram Helper ----------------------
+# ---------------- Telegram Helper ----------------
 def send_telegram(msg: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -47,7 +46,7 @@ def send_telegram(msg: str):
     except Exception as e:
         print("⚠️ Telegram send failed:", e)
 
-# ------------------- Kraken API ---------------------------
+# ---------------- Kraken API ----------------
 def require_keys():
     if not API_KEY or not API_SECRET:
         raise RuntimeError("KRAKEN_API_KEY and KRAKEN_API_SECRET must be set.")
@@ -80,7 +79,7 @@ def private_post(endpoint: str, data: dict):
     r.raise_for_status()
     return r.json()
 
-# ------------------- Market Functions ---------------------
+# ---------------- Market Functions ----------------
 def fetch_ohlc(pair: str, interval: int = OHLC_INTERVAL, count: int = OHLC_COUNT):
     resp = public_get("OHLC", {"pair": pair, "interval": interval})
     result = resp.get('result', {})
@@ -197,7 +196,7 @@ def save_last_action(actions_dict):
     with open(LAST_ACTION_FILE, "w") as f:
         json.dump(actions_dict, f)
 
-# ------------------- Main Loop ---------------------------
+# ---------------- Main Loop ----------------
 def main():
     send_telegram("🤖 Kraken scalping bot started!")
     print("Running PER-COIN scalping bot (Balanced Profile: 5/20 EMA, 1m candles)...")
@@ -239,4 +238,46 @@ def main():
                     resp, min_vol = place_market_order(pair, 'buy', eur_amount)
                     if resp:
                         price = get_price(pair)
-                        last
+                        last_action[base] = {"side": "buy", "price": price}
+                        fiat_balance -= eur_amount
+                        executed_any = True
+                        msg = f"🚀 BUY {base} executed at {price:.2f} {QUOTE}"
+                        print(f"{timestamp} | {msg}", resp)
+                        send_telegram(msg)
+                    else:
+                        print(f"{timestamp} | Not enough balance for min order ({min_vol} {base}). Skipping BUY.")
+
+                # SELL
+                elif signal == 'sell' and last.get('side') == 'buy' and balance > 0:
+                    buy_price = last['price']
+                    price = get_price(pair)
+                    target_price = buy_price * (1 + MIN_PROFIT)
+                    if price >= target_price:
+                        eur_equivalent = balance * price
+                        eur_amount = min(eur_equivalent, TRADE_EUR)
+                        resp, min_vol = place_market_order(pair, 'sell', eur_amount)
+                        if resp:
+                            last_action[base] = {"side": "sell"}
+                            executed_any = True
+                            msg = f"💰 SELL {base} executed at {price:.2f} {QUOTE}"
+                            print(f"{timestamp} | {msg}", resp)
+                            send_telegram(msg)
+                        else:
+                            print(f"{timestamp} | Not enough for min order ({min_vol} {base}). Skipping SELL.")
+                    else:
+                        print(f"{timestamp} | {base} sell skipped: current {price:.6f} < target {target_price:.6f}")
+
+            if executed_any:
+                save_last_action(last_action)
+            else:
+                print(f"{timestamp} | No trades executed. Last actions: {last_action}")
+
+        except Exception as e:
+            print(f"{timestamp} | Error in main loop:", e)
+            send_telegram(f"⚠️ Error in main loop: {e}")
+
+        time.sleep(POLL_INTERVAL)
+
+if __name__ == "__main__":
+    main()
+
