@@ -15,7 +15,7 @@ import json
 ASSETS = ["BTC", "LTC", "DOGE"]
 QUOTE = "EUR"
 
-TRADE_EUR = 30.0           # Max EUR per trade per coin
+TRADE_EUR = 50.0           # Max EUR per trade per coin
 MIN_PROFIT = 0.005         # Minimum profit threshold: 0.5% (~covers fees)
 
 SHORT_EMA = 5
@@ -225,7 +225,7 @@ def main():
                 df = fetch_ohlc(info['pair'], interval=OHLC_INTERVAL, count=OHLC_COUNT)
                 asset_signals[base] = generate_scalp_signal(df)
 
-            print(f"{timestamp} | Signals: {asset_signals} | Fiat: {fiat_balance:.4f} {QUOTE} | Balances: {per_asset_balances}")
+            print(f"{timestamp} | Signals: {asset_signals} | Fiat: {fiat_balance:.2f} {QUOTE} | Balances: {per_asset_balances}")
             executed_any = False
 
             for base, signal in asset_signals.items():
@@ -239,45 +239,4 @@ def main():
                     resp, min_vol = place_market_order(pair, 'buy', eur_amount)
                     if resp:
                         price = get_price(pair)
-                        last_action[base] = {"side": "buy", "price": price}
-                        fiat_balance -= eur_amount
-                        executed_any = True
-                        msg = f"🚀 BUY {base} executed at {price:.2f} {QUOTE}"
-                        print(f"{timestamp} | {msg}", resp)
-                        send_telegram(msg)
-                    else:
-                        print(f"{timestamp} | Not enough balance for min order ({min_vol} {base}). Skipping BUY.")
-
-                # SELL
-                elif signal == 'sell' and last.get('side') == 'buy' and balance > 0:
-                    buy_price = last['price']
-                    price = get_price(pair)
-                    target_price = buy_price * (1 + MIN_PROFIT)
-                    if price >= target_price:
-                        eur_equivalent = balance * price
-                        eur_amount = min(eur_equivalent, TRADE_EUR)
-                        resp, min_vol = place_market_order(pair, 'sell', eur_amount)
-                        if resp:
-                            last_action[base] = {"side": "sell"}
-                            executed_any = True
-                            msg = f"💰 SELL {base} executed at {price:.2f} {QUOTE}"
-                            print(f"{timestamp} | {msg}", resp)
-                            send_telegram(msg)
-                        else:
-                            print(f"{timestamp} | Not enough for min order ({min_vol} {base}). Skipping SELL.")
-                    else:
-                        print(f"{timestamp} | {base} sell skipped: current {price:.6f} < target {target_price:.6f}")
-
-            if executed_any:
-                save_last_action(last_action)
-            else:
-                print(f"{timestamp} | No trades executed. Last actions: {last_action}")
-
-        except Exception as e:
-            print(f"{timestamp} | Error in main loop:", e)
-            send_telegram(f"⚠️ Error in main loop: {e}")
-
-        time.sleep(POLL_INTERVAL)
-
-if __name__ == "__main__":
-    main()
+                        last
