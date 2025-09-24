@@ -15,8 +15,8 @@ import json
 ASSETS = ["BTC", "LTC", "DOGE"]
 QUOTE = "EUR"
 
-TRADE_EUR = 30.0  # Max EUR per trade per coin
-MIN_PROFIT = 0.005  # Minimum profit threshold: 0.5% (~covers fees)
+TRADE_EUR = 30.0   # Max EUR per trade per coin
+MIN_PROFIT = 0.005  # 0.5% profit threshold before selling
 
 SHORT_EMA = 5
 LONG_EMA = 20
@@ -24,7 +24,6 @@ OHLC_INTERVAL = 1
 OHLC_COUNT = 200
 
 POLL_INTERVAL = 30  # seconds between checks
-
 LAST_ACTION_FILE = "last_action.json"
 
 API_KEY = os.getenv("KRAKEN_API_KEY")
@@ -33,6 +32,7 @@ API_SECRET = os.getenv("KRAKEN_API_SECRET")
 
 API_BASE = "https://api.kraken.com"
 
+# ---------- Helpers ----------
 def require_keys():
     if not API_KEY or not API_SECRET:
         raise RuntimeError("KRAKEN_API_KEY and KRAKEN_API_SECRET must be set in environment.")
@@ -65,6 +65,7 @@ def private_post(endpoint: str, data: dict):
     r.raise_for_status()
     return r.json()
 
+# ---------- Data fetching ----------
 def fetch_ohlc(pair: str, interval: int = OHLC_INTERVAL, count: int = OHLC_COUNT):
     resp = public_get("OHLC", {"pair": pair, "interval": interval})
     result = resp.get('result', {})
@@ -74,7 +75,7 @@ def fetch_ohlc(pair: str, interval: int = OHLC_INTERVAL, count: int = OHLC_COUNT
             continue
         data = v
         break
-    if data is None:
+    if not data:
         raise RuntimeError(f"No OHLC data returned for {pair}")
     df = pd.DataFrame(data, columns=["time","open","high","low","close","vwap","volume","count"])
     df['close'] = df['close'].astype(float)
@@ -94,13 +95,18 @@ def generate_scalp_signal(df: pd.DataFrame):
         return 'sell'
     return None
 
+# ---------- Account ----------
 def get_balance():
     resp = private_post("Balance", {})
-    return resp['result']
+    result = resp.get("result", {})
+    if not isinstance(result, dict):
+        print("⚠️ Unexpected balance format:", result)
+        return {}
+    return result
 
 def get_all_assetpairs():
     resp = public_get("AssetPairs")
-    return resp['result']
+    return resp.get('result', {})
 
 def resolve_pairs(bases, quote=QUOTE):
     pairs_info = get_all_assetpairs()
@@ -132,8 +138,8 @@ def resolve_pairs(bases, quote=QUOTE):
     return resolved
 
 def get_min_order_volume(pair):
-    info = public_get("AssetPairs")
-    return float(info['result'][pair]['ordermin'])
+    info = get_all_assetpairs()
+    return float(info[pair]['ordermin'])
 
 def get_price(pair):
     ticker = public_get("Ticker", {"pair": pair})
@@ -144,6 +150,7 @@ def get_price(pair):
         return float(v['c'][0])
     return 0
 
+# ---------- Trading ----------
 def place_market_order(pair: str, side: str, eur_amount: float):
     price = get_price(pair)
     if price == 0:
@@ -153,7 +160,7 @@ def place_market_order(pair: str, side: str, eur_amount: float):
     if vol < min_vol:
         if side == "buy":
             needed_eur = price * min_vol
-            fiat_balance = float(get_balance().get("Z" + QUOTE, 0))
+            fiat_balance = float(get_balance().get("Z" + QUOTE, 0) or 0)
             if needed_eur > fiat_balance:
                 return None, min_vol
             vol = min_vol
@@ -168,6 +175,7 @@ def place_market_order(pair: str, side: str, eur_amount: float):
     resp = private_post("AddOrder", order)
     return resp, min_vol
 
+# ---------- State ----------
 def load_last_action():
     if os.path.exists(LAST_ACTION_FILE):
         with open(LAST_ACTION_FILE, "r") as f:
@@ -181,6 +189,7 @@ def save_last_action(actions_dict):
     with open(LAST_ACTION_FILE, "w") as f:
         json.dump(actions_dict, f)
 
+# ---------- Main loop ----------
 def main():
     print("Running PER-COIN scalping bot (Balanced Profile: 5/20 EMA, 1m candles) with min profit threshold...")
     last_action = load_last_action()
@@ -203,11 +212,14 @@ def main():
 
             asset_signals = {}
             for base, info in resolved.items():
-                df = fetch_ohlc(info['pair'], interval=OHLC_INTERVAL, count=OHLC_COUNT)
-                asset_signals[base] = generate_scalp_signal(df)
+                try:
+                    df = fetch_ohlc(info['pair'], interval=OHLC_INTERVAL, count=OHLC_COUNT)
+                    asset_signals[base] = generate_scalp_signal(df)
+                except Exception as e:
+                    print(f"{timestamp} | Error fetching signal for {base}: {e}")
+                    asset_signals[base] = None
 
             print(f"{timestamp} | Signals: {asset_signals} | Fiat: {fiat_balance:.4f} {QUOTE} | Balances: {per_asset_balances}")
-
             executed_any = False
 
             for base, signal in asset_signals.items():
