@@ -260,8 +260,7 @@ def main():
                     buy_price = last['price']
                     price = get_price(pair)
                     target_price = buy_price * (1 + MIN_PROFIT)
-                    if price >=
-                    target_price:
+                    if price >= target_price:
                         eur_equivalent = balance * price
                         eur_amount = min(eur_equivalent, TRADE_EUR)
                         resp, min_vol = place_market_order(pair, 'sell', eur_amount)
