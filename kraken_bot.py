@@ -11,15 +11,15 @@ import requests
 import pandas as pd
 import json
 
-# ---------------- CONFIG ----------------
-ASSETS = ["BTC", "LTC", "DOGE"]
+# ---------------- CONFIG (Faster EMA / Higher trades) ----------------
+ASSETS = ["ETH", "DOGE", "XRP"]
 QUOTE = "EUR"
 
 TRADE_EUR = 50.0           # Max EUR per trade per coin
-MIN_PROFIT = 0.005         # Minimum profit threshold (~0.5%)
+MIN_PROFIT = 0.005         # Minimum profit threshold: 0.5% (~covers fees)
 
-SHORT_EMA = 5
-LONG_EMA = 20
+SHORT_EMA = 3
+LONG_EMA = 8
 OHLC_INTERVAL = 1
 OHLC_COUNT = 200
 
@@ -33,9 +33,10 @@ API_SECRET = os.getenv("KRAKEN_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# -----------------------------------------------------------
 API_BASE = "https://api.kraken.com"
 
-# ---------------- Telegram Helper ----------------
+# ------------------- Telegram Helper ----------------------
 def send_telegram(msg: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -46,7 +47,7 @@ def send_telegram(msg: str):
     except Exception as e:
         print("⚠️ Telegram send failed:", e)
 
-# ---------------- Kraken API ----------------
+# ------------------- Kraken API ---------------------------
 def require_keys():
     if not API_KEY or not API_SECRET:
         raise RuntimeError("KRAKEN_API_KEY and KRAKEN_API_SECRET must be set.")
@@ -79,7 +80,7 @@ def private_post(endpoint: str, data: dict):
     r.raise_for_status()
     return r.json()
 
-# ---------------- Market Functions ----------------
+# ------------------- Market Functions ---------------------
 def fetch_ohlc(pair: str, interval: int = OHLC_INTERVAL, count: int = OHLC_COUNT):
     resp = public_get("OHLC", {"pair": pair, "interval": interval})
     result = resp.get('result', {})
@@ -183,11 +184,17 @@ def place_market_order(pair: str, side: str, eur_amount: float):
     resp = private_post("AddOrder", order)
     return resp, min_vol
 
+# ------------------- Load / Save Last Actions ----------------
 def load_last_action():
     if os.path.exists(LAST_ACTION_FILE):
         with open(LAST_ACTION_FILE, "r") as f:
             try:
-                return json.load(f)
+                data = json.load(f)
+                # Normalize old string entries to dict
+                for k, v in data.items():
+                    if isinstance(v, str):
+                        data[k] = {"side": v}
+                return data
             except Exception:
                 return {}
     return {}
@@ -196,10 +203,10 @@ def save_last_action(actions_dict):
     with open(LAST_ACTION_FILE, "w") as f:
         json.dump(actions_dict, f)
 
-# ---------------- Main Loop ----------------
+# ------------------- Main Loop ---------------------------
 def main():
     send_telegram("🤖 Kraken scalping bot started!")
-    print("Running PER-COIN scalping bot (Balanced Profile: 5/20 EMA, 1m candles)...")
+    print("Running PER-COIN scalping bot (ETH+DOGE+XRP, fast EMA)...")
     last_action = load_last_action()
     try:
         resolved = resolve_pairs(ASSETS, QUOTE)
@@ -207,9 +214,10 @@ def main():
         print("Error resolving pairs:", e)
         send_telegram(f"⚠️ Error resolving pairs: {e}")
         return
+
     print("Resolved pairs:")
     for base, info in resolved.items():
-        print(f"  {base} -> pair {info['pair']} (base asset code: {info['base_asset']})")
+        print(f"  {base} -> pair {info['pair']}")
 
     while True:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -252,7 +260,8 @@ def main():
                     buy_price = last['price']
                     price = get_price(pair)
                     target_price = buy_price * (1 + MIN_PROFIT)
-                    if price >= target_price:
+                    if price >=
+                    target_price:
                         eur_equivalent = balance * price
                         eur_amount = min(eur_equivalent, TRADE_EUR)
                         resp, min_vol = place_market_order(pair, 'sell', eur_amount)
@@ -278,6 +287,6 @@ def main():
 
         time.sleep(POLL_INTERVAL)
 
+
 if __name__ == "__main__":
     main()
-
