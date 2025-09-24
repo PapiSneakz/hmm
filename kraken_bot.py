@@ -15,27 +15,42 @@ import json
 ASSETS = ["BTC", "LTC", "DOGE"]
 QUOTE = "EUR"
 
-TRADE_EUR = 30.0   # Max EUR per trade per coin
-MIN_PROFIT = 0.005  # 0.5% profit threshold before selling
+TRADE_EUR = 30.0           # Max EUR per trade per coin
+MIN_PROFIT = 0.005         # Minimum profit threshold: 0.5% (~covers fees)
 
 SHORT_EMA = 5
 LONG_EMA = 20
 OHLC_INTERVAL = 1
 OHLC_COUNT = 200
 
-POLL_INTERVAL = 30  # seconds between checks
+POLL_INTERVAL = 30          # seconds between checks
 LAST_ACTION_FILE = "last_action.json"
 
 API_KEY = os.getenv("KRAKEN_API_KEY")
 API_SECRET = os.getenv("KRAKEN_API_SECRET")
-# -----------------------------------------------------------
 
+# Telegram
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# -----------------------------------------------------------
 API_BASE = "https://api.kraken.com"
 
-# ---------- Helpers ----------
+# ------------------- Telegram Helper ----------------------
+def send_telegram(msg: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+        requests.post(url, data=payload, timeout=10)
+    except Exception as e:
+        print("⚠️ Telegram send failed:", e)
+
+# ------------------- Kraken API ---------------------------
 def require_keys():
     if not API_KEY or not API_SECRET:
-        raise RuntimeError("KRAKEN_API_KEY and KRAKEN_API_SECRET must be set in environment.")
+        raise RuntimeError("KRAKEN_API_KEY and KRAKEN_API_SECRET must be set.")
 
 def _sign(path: str, data: dict, secret: str):
     post_data = urlencode(data)
@@ -65,7 +80,7 @@ def private_post(endpoint: str, data: dict):
     r.raise_for_status()
     return r.json()
 
-# ---------- Data fetching ----------
+# ------------------- Market Functions ---------------------
 def fetch_ohlc(pair: str, interval: int = OHLC_INTERVAL, count: int = OHLC_COUNT):
     resp = public_get("OHLC", {"pair": pair, "interval": interval})
     result = resp.get('result', {})
@@ -75,8 +90,8 @@ def fetch_ohlc(pair: str, interval: int = OHLC_INTERVAL, count: int = OHLC_COUNT
             continue
         data = v
         break
-    if not data:
-        raise RuntimeError(f"No OHLC data returned for {pair}")
+    if data is None:
+        raise RuntimeError(f"No OHLC data for {pair}")
     df = pd.DataFrame(data, columns=["time","open","high","low","close","vwap","volume","count"])
     df['close'] = df['close'].astype(float)
     return df.tail(count)
@@ -95,18 +110,13 @@ def generate_scalp_signal(df: pd.DataFrame):
         return 'sell'
     return None
 
-# ---------- Account ----------
 def get_balance():
     resp = private_post("Balance", {})
-    result = resp.get("result", {})
-    if not isinstance(result, dict):
-        print("⚠️ Unexpected balance format:", result)
-        return {}
-    return result
+    return resp['result']
 
 def get_all_assetpairs():
     resp = public_get("AssetPairs")
-    return resp.get('result', {})
+    return resp['result']
 
 def resolve_pairs(bases, quote=QUOTE):
     pairs_info = get_all_assetpairs()
@@ -138,8 +148,8 @@ def resolve_pairs(bases, quote=QUOTE):
     return resolved
 
 def get_min_order_volume(pair):
-    info = get_all_assetpairs()
-    return float(info[pair]['ordermin'])
+    info = public_get("AssetPairs")
+    return float(info['result'][pair]['ordermin'])
 
 def get_price(pair):
     ticker = public_get("Ticker", {"pair": pair})
@@ -150,7 +160,6 @@ def get_price(pair):
         return float(v['c'][0])
     return 0
 
-# ---------- Trading ----------
 def place_market_order(pair: str, side: str, eur_amount: float):
     price = get_price(pair)
     if price == 0:
@@ -160,7 +169,7 @@ def place_market_order(pair: str, side: str, eur_amount: float):
     if vol < min_vol:
         if side == "buy":
             needed_eur = price * min_vol
-            fiat_balance = float(get_balance().get("Z" + QUOTE, 0) or 0)
+            fiat_balance = float(get_balance().get("Z" + QUOTE, 0))
             if needed_eur > fiat_balance:
                 return None, min_vol
             vol = min_vol
@@ -175,7 +184,6 @@ def place_market_order(pair: str, side: str, eur_amount: float):
     resp = private_post("AddOrder", order)
     return resp, min_vol
 
-# ---------- State ----------
 def load_last_action():
     if os.path.exists(LAST_ACTION_FILE):
         with open(LAST_ACTION_FILE, "r") as f:
@@ -189,14 +197,16 @@ def save_last_action(actions_dict):
     with open(LAST_ACTION_FILE, "w") as f:
         json.dump(actions_dict, f)
 
-# ---------- Main loop ----------
+# ------------------- Main Loop ---------------------------
 def main():
-    print("Running PER-COIN scalping bot (Balanced Profile: 5/20 EMA, 1m candles) with min profit threshold...")
+    send_telegram("🤖 Kraken scalping bot started!")
+    print("Running PER-COIN scalping bot (Balanced Profile: 5/20 EMA, 1m candles)...")
     last_action = load_last_action()
     try:
         resolved = resolve_pairs(ASSETS, QUOTE)
     except Exception as e:
-        print("Error resolving asset pairs:", e)
+        print("Error resolving pairs:", e)
+        send_telegram(f"⚠️ Error resolving pairs: {e}")
         return
     print("Resolved pairs:")
     for base, info in resolved.items():
@@ -212,12 +222,8 @@ def main():
 
             asset_signals = {}
             for base, info in resolved.items():
-                try:
-                    df = fetch_ohlc(info['pair'], interval=OHLC_INTERVAL, count=OHLC_COUNT)
-                    asset_signals[base] = generate_scalp_signal(df)
-                except Exception as e:
-                    print(f"{timestamp} | Error fetching signal for {base}: {e}")
-                    asset_signals[base] = None
+                df = fetch_ohlc(info['pair'], interval=OHLC_INTERVAL, count=OHLC_COUNT)
+                asset_signals[base] = generate_scalp_signal(df)
 
             print(f"{timestamp} | Signals: {asset_signals} | Fiat: {fiat_balance:.4f} {QUOTE} | Balances: {per_asset_balances}")
             executed_any = False
@@ -236,7 +242,9 @@ def main():
                         last_action[base] = {"side": "buy", "price": price}
                         fiat_balance -= eur_amount
                         executed_any = True
-                        print(f"{timestamp} | BUY {base} executed at {price}:", resp)
+                        msg = f"🚀 BUY {base} executed at {price:.2f} {QUOTE}"
+                        print(f"{timestamp} | {msg}", resp)
+                        send_telegram(msg)
                     else:
                         print(f"{timestamp} | Not enough balance for min order ({min_vol} {base}). Skipping BUY.")
 
@@ -252,7 +260,9 @@ def main():
                         if resp:
                             last_action[base] = {"side": "sell"}
                             executed_any = True
-                            print(f"{timestamp} | SELL {base} executed at {price}:", resp)
+                            msg = f"💰 SELL {base} executed at {price:.2f} {QUOTE}"
+                            print(f"{timestamp} | {msg}", resp)
+                            send_telegram(msg)
                         else:
                             print(f"{timestamp} | Not enough for min order ({min_vol} {base}). Skipping SELL.")
                     else:
@@ -265,6 +275,7 @@ def main():
 
         except Exception as e:
             print(f"{timestamp} | Error in main loop:", e)
+            send_telegram(f"⚠️ Error in main loop: {e}")
 
         time.sleep(POLL_INTERVAL)
 
