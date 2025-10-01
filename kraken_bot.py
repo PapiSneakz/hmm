@@ -1,35 +1,53 @@
 # kraken_bot.py
 """
-Improved Kraken scalping bot with detailed logging, retry/backoff, and Discord/Telegram alerts.
-- Detailed "reason" logs when trades are skipped (like original long version).
-- Sends cycles and trade alerts to Discord with @everyone.
-- Retries network/HTTP errors with exponential backoff + jitter.
-- Falls back to cached prices if OHLC/ticker fails temporarily.
-"""
+Improved Kraken scalping bot with robust error handling, retry/backoff, and Discord alerts.
+- Retries network/HTTP errors with exponential backoff + jitter
+- Falls back to cached prices when public API temporarily fails (to allow trading)
+- Handles Kraken API "error" payloads gracefully
+- Keeps attempting trades aggressively but safely (respects minimum order volume)
+- Sends Telegram and Discord alerts on failures and trades
 
+Notes:
+- Keep your KRAKEN_API_KEY, KRAKEN_API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, and DISCORD_WEBHOOK in environment or .env
+"""
 from dotenv import load_dotenv
 load_dotenv()
-import os, time, hmac, hashlib, base64, json, logging, random
+import os
+import time
+import hmac
+import hashlib
+import base64
 from urllib.parse import urlencode
+import requests
+import pandas as pd
+import json
+import logging
+import random
 from typing import Tuple, Optional
-import requests, pandas as pd
 
 # ---------------- CONFIG ----------------
 ASSETS = ["ETH", "DOGE", "XRP"]
 QUOTE = "EUR"
-TRADE_EUR = 50.0
-MIN_PROFIT = 0.012   # 1.2% profit target
+
+TRADE_EUR = 50.0           # Max EUR per trade per coin
+MIN_PROFIT = 0.012         # 1.2% profit target (covers ~0.5% Kraken fees)
+
 SHORT_EMA = 5
 LONG_EMA = 20
 OHLC_INTERVAL = 1
 OHLC_COUNT = 200
-POLL_INTERVAL = 30
+
+POLL_INTERVAL = 30         # seconds between checks
 LAST_ACTION_FILE = "last_action.json"
 
 API_KEY = os.getenv("KRAKEN_API_KEY")
 API_SECRET = os.getenv("KRAKEN_API_SECRET")
+
+# Telegram
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# Discord
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 
 API_BASE = "https://api.kraken.com"
@@ -39,17 +57,22 @@ MAX_RETRIES = 5
 INITIAL_BACKOFF = 1.0
 BACKOFF_FACTOR = 2.0
 JITTER = 0.3
-ALERT_FAILURE_THRESHOLD = 6
 
+# Failure thresholds
+ALERT_FAILURE_THRESHOLD = 6  # consecutive public/private errors before Telegram alert
+
+# Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("kraken_bot")
 
+# In-memory caches
 price_cache = {}
 ordermin_cache = {}
+
 consecutive_public_errors = 0
 consecutive_private_errors = 0
 
-# ------------------- Alerts ----------------------
+# ------------------- Telegram ----------------------
 def send_telegram(msg: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -59,18 +82,17 @@ def send_telegram(msg: str):
     except Exception as e:
         logger.warning("⚠️ Telegram send failed: %s", e)
 
+# ------------------- Discord ----------------------
 def send_discord(msg: str, ping_everyone: bool = False):
     if not DISCORD_WEBHOOK:
         return
     content = f"@everyone {msg}" if ping_everyone else msg
     try:
-        r = requests.post(DISCORD_WEBHOOK, json={"content": content}, timeout=10)
-        if r.status_code >= 400:
-            logger.warning("⚠️ Discord webhook failed: %s %s", r.status_code, r.text)
+        requests.post(DISCORD_WEBHOOK, json={"content": content}, timeout=10)
     except Exception as e:
         logger.warning("⚠️ Discord send failed: %s", e)
 
-# ------------------- Retry ----------------------
+# ------------------- Retry ------------------
 def _sleep_backoff(attempt: int):
     base = INITIAL_BACKOFF * (BACKOFF_FACTOR ** attempt)
     jitter = base * JITTER
@@ -94,7 +116,7 @@ def request_with_retry(fn, *args, is_private=False, **kwargs):
             _sleep_backoff(attempt)
         except Exception as e:
             last_exc = e
-            logger.exception("Unexpected error: %s", e)
+            logger.exception("Unexpected error during request: %s", e)
             _sleep_backoff(attempt)
 
     if is_private:
@@ -107,7 +129,7 @@ def request_with_retry(fn, *args, is_private=False, **kwargs):
             send_telegram(f"⚠️ Kraken public API failing repeatedly ({consecutive_public_errors} errors)")
     raise last_exc
 
-# ------------------- Kraken API ------------------
+# ------------------- Kraken API ---------------------------
 def require_keys():
     if not API_KEY or not API_SECRET:
         raise RuntimeError("KRAKEN_API_KEY and KRAKEN_API_SECRET must be set.")
@@ -141,14 +163,14 @@ def private_post(endpoint: str, data: dict) -> dict:
         return r.json()
     return request_with_retry(_fn, is_private=True)
 
-# ------------------- Market functions ---------------------
+# ------------------- Market Functions ---------------------
 def fetch_ohlc(pair: str, interval=OHLC_INTERVAL, count=OHLC_COUNT) -> pd.DataFrame:
     resp = public_get("OHLC", {"pair": pair, "interval": interval})
     if resp.get("error"):
         raise RuntimeError(f"OHLC error: {resp['error']}")
     result = resp.get("result", {})
     data = next((v for k, v in result.items() if k != "last"), None)
-    if not data:
+    if data is None:
         raise RuntimeError(f"No OHLC data for {pair}")
     df = pd.DataFrame(data, columns=["time","open","high","low","close","vwap","volume","count"])
     df['close'] = df['close'].astype(float)
@@ -186,13 +208,15 @@ def resolve_pairs(bases, quote=QUOTE):
         for pair_key, info in pairs_info.items():
             alt, ws = info.get('altname',''), info.get('wsname','')
             if base.upper() in f"{pair_key} {alt} {ws}".upper() and quote.upper() in f"{pair_key} {alt} {ws}".upper():
-                match = (pair_key, info); break
+                match = (pair_key, info)
+                break
         if not match:
             for pair_key, info in pairs_info.items():
                 if base.upper() in pair_key.upper() and quote.upper() in pair_key.upper():
-                    match = (pair_key, info); break
+                    match = (pair_key, info)
+                    break
         if not match:
-            raise RuntimeError(f"Could not resolve pair for {base}/{quote}")
+            raise RuntimeError(f"Could not resolve pair for {base}/{quote}.")
         resolved[base.upper()] = {"pair": match[0], "base_asset": match[1].get("base")}
     return resolved
 
@@ -226,33 +250,38 @@ def place_market_order(pair, side, eur_amount) -> Tuple[Optional[dict], float]:
         price = get_price(pair)
     except Exception:
         return None, get_min_order_volume(pair)
+
     vol = round(eur_amount / price, 8)
     min_vol = get_min_order_volume(pair)
     if vol < min_vol:
         return None, min_vol
+
     order = {"ordertype": "market","type": side,"volume": str(vol),"pair": pair}
     resp = private_post("AddOrder", order)
     if resp.get("error"):
         return None, min_vol
     return resp, min_vol
 
-# ------------------- Last actions ----------------
+# ------------------- Last Actions ----------------
 def load_last_action():
     if os.path.exists(LAST_ACTION_FILE):
         try:
-            with open(LAST_ACTION_FILE) as f: return json.load(f)
-        except: return {}
+            with open(LAST_ACTION_FILE) as f:
+                return json.load(f)
+        except:
+            return {}
     return {}
 
 def save_last_action(actions):
     try:
-        with open(LAST_ACTION_FILE, "w") as f: json.dump(actions, f)
+        with open(LAST_ACTION_FILE, "w") as f:
+            json.dump(actions, f)
     except Exception as e:
         logger.warning("Failed to save last_action: %s", e)
 
-# ------------------- Main loop -------------------
+# ------------------- Main Loop ---------------------------
 def main():
-    send_discord("🤖 Kraken scalping bot started with profit protection!", ping_everyone=True)
+    send_discord("🤖 Kraken scalping bot started with profit protection!")
     logger.info("Running scalping bot...")
     last_action = load_last_action()
     resolved = resolve_pairs(ASSETS, QUOTE)
@@ -273,11 +302,13 @@ def main():
                     logger.warning("OHLC fail %s: %s", base, e)
                     asset_signals[base] = None
 
+            # Log the cycle but don't ping @everyone
             cycle_msg = f"{timestamp} | Signals: {asset_signals} | Fiat: {fiat_balance:.2f} {QUOTE} | Balances: {per_asset_balances}"
             logger.info(cycle_msg)
-            send_discord(cycle_msg, ping_everyone=True)
+            send_discord(cycle_msg, ping_everyone=False)
 
             executed_any = False
+
             for base, signal in asset_signals.items():
                 pair = resolved[base]['pair']
                 balance = per_asset_balances[base]
@@ -286,8 +317,8 @@ def main():
                 # -------- BUY --------
                 if signal == 'buy' and last.get('side') != 'buy':
                     if fiat_balance < 1:
-                        reason = f"{timestamp} | Skipping BUY {base}: not enough fiat (%.2f {QUOTE})" % fiat_balance
-                        logger.info(reason); send_discord(reason, ping_everyone=True); continue
+                        logger.info("%s | Skipping BUY %s: not enough fiat (%.2f %s)", timestamp, base, fiat_balance, QUOTE)
+                        continue
                     eur_amount = min(TRADE_EUR, fiat_balance)
                     resp, min_vol = place_market_order(pair, 'buy', eur_amount)
                     if resp:
@@ -299,27 +330,29 @@ def main():
                         logger.info("%s | %s", timestamp, msg)
                         send_discord(msg, ping_everyone=True)
                     else:
-                        reason = f"{timestamp} | Skipping BUY {base}: below min order (%.8f < %.8f)" % (eur_amount, min_vol)
-                        logger.info(reason); send_discord(reason, ping_everyone=True)
+                        logger.info("%s | Skipping BUY %s: below min order (%.8f < %.8f)", timestamp, base, eur_amount, min_vol)
 
                 # -------- SELL --------
                 elif signal == 'sell' and last.get('side') == 'buy':
                     buy_price = last.get('price')
-                    try: price = get_price(pair)
-                    except Exception as e: logger.warning("No price for %s: %s", base, e); price = None
+                    price = None
+                    try:
+                        price = get_price(pair)
+                    except Exception as e:
+                        logger.warning("No price for %s: %s", base, e)
 
                     if balance <= 0:
-                        reason = f"{timestamp} | Skipping SELL {base}: balance is zero"
+                        logger.info("%s | Skipping SELL %s: balance is zero", timestamp, base)
                     elif buy_price is None:
-                        reason = f"{timestamp} | Skipping SELL {base}: no stored buy price"
+                        logger.info("%s | Skipping SELL %s: no stored buy price", timestamp, base)
                     elif price is None:
-                        reason = f"{timestamp} | Skipping SELL {base}: no price available"
+                        logger.info("%s | Skipping SELL %s: no price available", timestamp, base)
                     else:
                         target_price = buy_price * (1 + MIN_PROFIT)
                         if price < buy_price:
-                            reason = f"{timestamp} | Skipping SELL {base}: price {price:.6f} < buy {buy_price:.6f}"
+                            logger.info("%s | Skipping SELL %s: price %.6f < buy price %.6f", timestamp, base, price, buy_price)
                         elif price < target_price:
-                            reason = f"{timestamp} | Skipping SELL {base}: price {price:.6f} < target profit {target_price:.6f}"
+                            logger.info("%s | Skipping SELL %s: price %.6f < target profit %.6f", timestamp, base, price, target_price)
                         else:
                             eur_equivalent = balance * price
                             eur_amount = min(eur_equivalent, TRADE_EUR)
@@ -329,19 +362,21 @@ def main():
                                 executed_any = True
                                 msg = f"💰 SELL {base} at {price:.6f} {QUOTE}"
                                 logger.info("%s | %s", timestamp, msg)
-                                send_discord(msg, ping_everyone=True); reason = None
+                                send_discord(msg, ping_everyone=True)
                             else:
-                                reason = f"{timestamp} | Skipping SELL {base}: order below min volume %.8f" % min_vol
-                    if reason:
-                        logger.info(reason); send_discord(reason, ping_everyone=True)
+                                logger.info("%s | Skipping SELL %s: order below min volume %.8f", timestamp, base, min_vol)
 
-            if executed_any: save_last_action(last_action)
+            if executed_any:
+                save_last_action(last_action)
+            else:
+                logger.info("%s | No trades executed.", timestamp)
 
         except Exception as e:
-            err = f"{timestamp} | Error in main loop: {e}"
-            logger.exception(err); send_discord("⚠️ " + err, ping_everyone=True)
+            logger.exception("%s | Error in main loop: %s", timestamp, e)
+            send_discord(f"⚠️ Error in main loop: {e}")
 
         time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
     main()
+
