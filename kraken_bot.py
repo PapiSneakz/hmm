@@ -222,7 +222,7 @@ def resolve_pairs(bases, quote=QUOTE):
 
 def get_min_order_volume(pair):
     if pair in ordermin_cache:
-        return ordermin_cache[pair]
+        return ordermin_cache[pair
     info = public_get("AssetPairs")
     result = info.get("result", {})
     minv = float(result[pair].get("ordermin", 0))
@@ -302,7 +302,7 @@ def main():
                     logger.warning("OHLC fail %s: %s", base, e)
                     asset_signals[base] = None
 
-            # Log the cycle but don't ping @everyone
+            # Log the cycle
             cycle_msg = f"{timestamp} | Signals: {asset_signals} | Fiat: {fiat_balance:.2f} {QUOTE} | Balances: {per_asset_balances}"
             logger.info(cycle_msg)
             send_discord(cycle_msg, ping_everyone=False)
@@ -317,7 +317,9 @@ def main():
                 # -------- BUY --------
                 if signal == 'buy' and last.get('side') != 'buy':
                     if fiat_balance < 1:
-                        logger.info("%s | Skipping BUY %s: not enough fiat (%.2f %s)", timestamp, base, fiat_balance, QUOTE)
+                        msg = f"{timestamp} | Skipping BUY {base}: not enough fiat (%.2f {QUOTE})" % fiat_balance
+                        logger.info(msg)
+                        send_discord(msg)
                         continue
                     eur_amount = min(TRADE_EUR, fiat_balance)
                     resp, min_vol = place_market_order(pair, 'buy', eur_amount)
@@ -330,7 +332,9 @@ def main():
                         logger.info("%s | %s", timestamp, msg)
                         send_discord(msg, ping_everyone=True)
                     else:
-                        logger.info("%s | Skipping BUY %s: below min order (%.8f < %.8f)", timestamp, base, eur_amount, min_vol)
+                        msg = f"{timestamp} | Skipping BUY {base}: below min order (%.8f < %.8f)" % (eur_amount, min_vol)
+                        logger.info(msg)
+                        send_discord(msg)
 
                 # -------- SELL --------
                 elif signal == 'sell' and last.get('side') == 'buy':
@@ -340,19 +344,30 @@ def main():
                         price = get_price(pair)
                     except Exception as e:
                         logger.warning("No price for %s: %s", base, e)
+                        send_discord(f"{timestamp} | No price for {base}: {e}")
 
                     if balance <= 0:
-                        logger.info("%s | Skipping SELL %s: balance is zero", timestamp, base)
+                        msg = f"{timestamp} | Skipping SELL {base}: balance is zero"
+                        logger.info(msg)
+                        send_discord(msg)
                     elif buy_price is None:
-                        logger.info("%s | Skipping SELL %s: no stored buy price", timestamp, base)
+                        msg = f"{timestamp} | Skipping SELL {base}: no stored buy price"
+                        logger.info(msg)
+                        send_discord(msg)
                     elif price is None:
-                        logger.info("%s | Skipping SELL %s: no price available", timestamp, base)
+                        msg = f"{timestamp} | Skipping SELL {base}: no price available"
+                        logger.info(msg)
+                        send_discord(msg)
                     else:
                         target_price = buy_price * (1 + MIN_PROFIT)
                         if price < buy_price:
-                            logger.info("%s | Skipping SELL %s: price %.6f < buy price %.6f", timestamp, base, price, buy_price)
+                            msg = f"{timestamp} | Skipping SELL {base}: price %.6f < buy price %.6f" % (price, buy_price)
+                            logger.info(msg)
+                            send_discord(msg)
                         elif price < target_price:
-                            logger.info("%s | Skipping SELL %s: price %.6f < target profit %.6f", timestamp, base, price, target_price)
+                            msg = f"{timestamp} | Skipping SELL {base}: price %.6f < target profit %.6f" % (price, target_price)
+                            logger.info(msg)
+                            send_discord(msg)
                         else:
                             eur_equivalent = balance * price
                             eur_amount = min(eur_equivalent, TRADE_EUR)
@@ -364,12 +379,16 @@ def main():
                                 logger.info("%s | %s", timestamp, msg)
                                 send_discord(msg, ping_everyone=True)
                             else:
-                                logger.info("%s | Skipping SELL %s: order below min volume %.8f", timestamp, base, min_vol)
+                                msg = f"{timestamp} | Skipping SELL {base}: order below min volume %.8f" % min_vol
+                                logger.info(msg)
+                                send_discord(msg)
 
             if executed_any:
                 save_last_action(last_action)
             else:
-                logger.info("%s | No trades executed.", timestamp)
+                msg = f"{timestamp} | No trades executed."
+                logger.info(msg)
+                send_discord(msg)
 
         except Exception as e:
             logger.exception("%s | Error in main loop: %s", timestamp, e)
@@ -379,4 +398,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
