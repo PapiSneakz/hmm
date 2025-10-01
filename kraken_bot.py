@@ -222,7 +222,7 @@ def resolve_pairs(bases, quote=QUOTE):
 
 def get_min_order_volume(pair):
     if pair in ordermin_cache:
-        return ordermin_cache[pair
+        return ordermin_cache[pair]
     info = public_get("AssetPairs")
     result = info.get("result", {})
     minv = float(result[pair].get("ordermin", 0))
