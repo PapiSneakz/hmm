@@ -245,22 +245,23 @@ def get_price(pair):
             return price_cache[pair]
         raise
 
-def place_market_order(pair, side, eur_amount) -> Tuple[Optional[dict], float]:
+def place_market_order(pair, side, eur_amount) -> Tuple[Optional[dict], float, str]:
+    """Returns tuple (response, min_vol, fail_reason)."""
     try:
         price = get_price(pair)
-    except Exception:
-        return None, get_min_order_volume(pair)
+    except Exception as e:
+        return None, get_min_order_volume(pair), f"Failed to fetch price: {e}"
 
     vol = round(eur_amount / price, 8)
     min_vol = get_min_order_volume(pair)
     if vol < min_vol:
-        return None, min_vol
+        return None, min_vol, f"Order volume too small: {vol:.8f} < min {min_vol:.8f}"
 
     order = {"ordertype": "market","type": side,"volume": str(vol),"pair": pair}
     resp = private_post("AddOrder", order)
     if resp.get("error"):
-        return None, min_vol
-    return resp, min_vol
+        return None, min_vol, f"Kraken API error: {resp['error']}"
+    return resp, min_vol, ""
 
 # ------------------- Last Actions ----------------
 def load_last_action():
@@ -317,12 +318,12 @@ def main():
                 # -------- BUY --------
                 if signal == 'buy' and last.get('side') != 'buy':
                     if fiat_balance < 1:
-                        msg = f"{timestamp} | Skipping BUY {base}: not enough fiat (%.2f {QUOTE})" % fiat_balance
+                        msg = f"{timestamp} | Skipping BUY {base}: not enough fiat ({fiat_balance:.2f} {QUOTE})"
                         logger.info(msg)
                         send_discord(msg)
                         continue
                     eur_amount = min(TRADE_EUR, fiat_balance)
-                    resp, min_vol = place_market_order(pair, 'buy', eur_amount)
+                    resp, min_vol, reason = place_market_order(pair, 'buy', eur_amount)
                     if resp:
                         price = get_price(pair)
                         last_action[base] = {"side": "buy", "price": price}
@@ -332,7 +333,7 @@ def main():
                         logger.info("%s | %s", timestamp, msg)
                         send_discord(msg, ping_everyone=True)
                     else:
-                        msg = f"{timestamp} | Skipping BUY {base}: below min order (%.8f < %.8f)" % (eur_amount, min_vol)
+                        msg = f"{timestamp} | Skipping BUY {base}: {reason}"
                         logger.info(msg)
                         send_discord(msg)
 
@@ -343,8 +344,9 @@ def main():
                     try:
                         price = get_price(pair)
                     except Exception as e:
-                        logger.warning("No price for %s: %s", base, e)
-                        send_discord(f"{timestamp} | No price for {base}: {e}")
+                        msg = f"{timestamp} | No price for {base}: {e}"
+                        logger.warning(msg)
+                        send_discord(msg)
 
                     if balance <= 0:
                         msg = f"{timestamp} | Skipping SELL {base}: balance is zero"
@@ -361,17 +363,17 @@ def main():
                     else:
                         target_price = buy_price * (1 + MIN_PROFIT)
                         if price < buy_price:
-                            msg = f"{timestamp} | Skipping SELL {base}: price %.6f < buy price %.6f" % (price, buy_price)
+                            msg = f"{timestamp} | Skipping SELL {base}: price {price:.6f} < buy price {buy_price:.6f}"
                             logger.info(msg)
                             send_discord(msg)
                         elif price < target_price:
-                            msg = f"{timestamp} | Skipping SELL {base}: price %.6f < target profit %.6f" % (price, target_price)
+                            msg = f"{timestamp} | Skipping SELL {base}: price {price:.6f} < target profit {target_price:.6f}"
                             logger.info(msg)
                             send_discord(msg)
                         else:
                             eur_equivalent = balance * price
                             eur_amount = min(eur_equivalent, TRADE_EUR)
-                            resp, min_vol = place_market_order(pair, 'sell', eur_amount)
+                            resp, min_vol, reason = place_market_order(pair, 'sell', eur_amount)
                             if resp:
                                 last_action[base] = {"side": "sell"}
                                 executed_any = True
@@ -379,7 +381,7 @@ def main():
                                 logger.info("%s | %s", timestamp, msg)
                                 send_discord(msg, ping_everyone=True)
                             else:
-                                msg = f"{timestamp} | Skipping SELL {base}: order below min volume %.8f" % min_vol
+                                msg = f"{timestamp} | Skipping SELL {base}: {reason}"
                                 logger.info(msg)
                                 send_discord(msg)
 
