@@ -1,15 +1,14 @@
 # kraken_bot.py
 """
-Improved Kraken scalping bot with robust error handling and retry/backoff.
+Improved Kraken scalping bot with robust error handling, retry/backoff, and Discord alerts.
 - Retries network/HTTP errors with exponential backoff + jitter
 - Falls back to cached prices when public API temporarily fails (to allow trading)
 - Handles Kraken API "error" payloads gracefully
 - Keeps attempting trades aggressively but safely (respects minimum order volume)
-- Sends Telegram alerts on repeated failures
+- Sends Telegram and Discord alerts on failures and trades
 
 Notes:
-- Keep your KRAKEN_API_KEY, KRAKEN_API_SECRET, TELEGRAM_TOKEN and TELEGRAM_CHAT_ID in environment or .env
-- This file replaces the previous version; do NOT duplicate functionality elsewhere.
+- Keep your KRAKEN_API_KEY, KRAKEN_API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, and DISCORD_WEBHOOK in environment or .env
 """
 from dotenv import load_dotenv
 load_dotenv()
@@ -48,6 +47,9 @@ API_SECRET = os.getenv("KRAKEN_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# Discord
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
+
 API_BASE = "https://api.kraken.com"
 
 # Retry settings
@@ -83,6 +85,17 @@ def send_telegram(msg: str):
     except Exception as e:
         logger.warning("⚠️ Telegram send failed: %s", e)
 
+# ------------------- Discord ----------------------
+def send_discord(msg: str, ping_everyone: bool = False):
+    if not DISCORD_WEBHOOK:
+        logger.debug("Discord webhook not configured, skipping message")
+        return
+    content = f"@everyone {msg}" if ping_everyone else msg
+    try:
+        requests.post(DISCORD_WEBHOOK, json={"content": content}, timeout=10)
+    except Exception as e:
+        logger.warning("⚠️ Discord send failed: %s", e)
+
 # ------------------- Utilities & Retry ------------------
 def _sleep_backoff(attempt: int):
     base = INITIAL_BACKOFF * (BACKOFF_FACTOR ** attempt)
@@ -93,16 +106,12 @@ def _sleep_backoff(attempt: int):
     time.sleep(wait)
 
 def request_with_retry(fn, *args, is_private=False, **kwargs):
-    """Call `fn(*args, **kwargs)` with retries on network/HTTP errors.
-    Returns the function's return value or raises last exception after retries.
-    Updates global error counters for alerts.
-    """
+    """Call `fn(*args, **kwargs)` with retries on network/HTTP errors."""
     global consecutive_public_errors, consecutive_private_errors
     last_exc = None
     for attempt in range(MAX_RETRIES):
         try:
             result = fn(*args, **kwargs)
-            # reset failure counters on success
             if is_private:
                 consecutive_private_errors = 0
             else:
@@ -129,14 +138,12 @@ def request_with_retry(fn, *args, is_private=False, **kwargs):
         logger.error("Public API failed %d times", consecutive_public_errors)
         if consecutive_public_errors >= ALERT_FAILURE_THRESHOLD:
             send_telegram(f"⚠️ Kraken public API failing repeatedly: {consecutive_public_errors} errors")
-    # raise last exception for caller to decide; many callers will handle errors
     raise last_exc
 
 # ------------------- Kraken API ---------------------------
 def require_keys():
     if not API_KEY or not API_SECRET:
         raise RuntimeError("KRAKEN_API_KEY and KRAKEN_API_SECRET must be set.")
-
 
 def _sign(path: str, data: dict, secret: str):
     post_data = urlencode(data)
@@ -145,22 +152,18 @@ def _sign(path: str, data: dict, secret: str):
     mac = hmac.new(base64.b64decode(secret), message, hashlib.sha512)
     return base64.b64encode(mac.digest()).decode()
 
-
 def public_get(endpoint: str, params: dict = None) -> dict:
     url = f"{API_BASE}/0/public/{endpoint}"
-
     def _fn():
         r = requests.get(url, params=params, timeout=15)
         r.raise_for_status()
         return r.json()
-
     return request_with_retry(_fn, is_private=False)
-
 
 def private_post(endpoint: str, data: dict) -> dict:
     require_keys()
     path = f"/0/private/{endpoint}"
-    data = dict(data)  # copy
+    data = dict(data)
     data['nonce'] = int(time.time() * 1000)
     signature = _sign(path, data, API_SECRET)
     headers = {
@@ -169,25 +172,20 @@ def private_post(endpoint: str, data: dict) -> dict:
         "Content-Type": "application/x-www-form-urlencoded",
     }
     url = f"{API_BASE}{path}"
-
     def _fn():
         r = requests.post(url, headers=headers, data=data, timeout=15)
         r.raise_for_status()
         return r.json()
-
     return request_with_retry(_fn, is_private=True)
 
 # ------------------- Market Functions ---------------------
-
 def fetch_ohlc(pair: str, interval: int = OHLC_INTERVAL, count: int = OHLC_COUNT) -> pd.DataFrame:
     resp = public_get("OHLC", {"pair": pair, "interval": interval})
     if not isinstance(resp, dict):
         raise RuntimeError("Unexpected OHLC response")
     if resp.get('error'):
-        # Kraken may return temporary errors in the payload
         logger.warning("OHLC API returned errors: %s", resp.get('error'))
         raise RuntimeError("OHLC returned error: %s" % resp.get('error'))
-
     result = resp.get('result', {})
     data = None
     for k, v in result.items():
@@ -200,7 +198,6 @@ def fetch_ohlc(pair: str, interval: int = OHLC_INTERVAL, count: int = OHLC_COUNT
     df = pd.DataFrame(data, columns=["time","open","high","low","close","vwap","volume","count"])
     df['close'] = df['close'].astype(float)
     return df.tail(count)
-
 
 def generate_scalp_signal(df: pd.DataFrame):
     if len(df) < LONG_EMA + 2:
@@ -216,7 +213,6 @@ def generate_scalp_signal(df: pd.DataFrame):
         return 'sell'
     return None
 
-
 def get_balance() -> dict:
     resp = private_post("Balance", {})
     if not isinstance(resp, dict):
@@ -225,13 +221,11 @@ def get_balance() -> dict:
         raise RuntimeError("Balance error: %s" % resp.get('error'))
     return resp.get('result', {})
 
-
 def get_all_assetpairs() -> dict:
     resp = public_get("AssetPairs")
     if resp.get('error'):
         raise RuntimeError("AssetPairs error: %s" % resp.get('error'))
     return resp.get('result', {})
-
 
 def resolve_pairs(bases, quote=QUOTE):
     pairs_info = get_all_assetpairs()
@@ -262,9 +256,7 @@ def resolve_pairs(bases, quote=QUOTE):
         }
     return resolved
 
-
 def get_min_order_volume(pair) -> float:
-    # cache ordemin to reduce public requests
     if pair in ordermin_cache:
         return ordermin_cache[pair]
     info = public_get("AssetPairs")
@@ -275,9 +267,7 @@ def get_min_order_volume(pair) -> float:
     ordermin_cache[pair] = minv
     return minv
 
-
 def get_price(pair) -> float:
-    # attempt to fetch real-time price; fall back to cache if public API fails
     try:
         ticker = public_get("Ticker", {"pair": pair})
         if ticker.get('error'):
@@ -291,25 +281,16 @@ def get_price(pair) -> float:
             return price
     except Exception as e:
         logger.warning("Failed to fetch price for %s: %s", pair, e)
-        # fall back to last cached price if available
         if pair in price_cache:
             logger.info("Using cached price for %s: %s", pair, price_cache[pair])
             return price_cache[pair]
-        # if no cached price, propagate exception
         raise
 
-
 def place_market_order(pair: str, side: str, eur_amount: float) -> Tuple[Optional[dict], float]:
-    """Place a market order by EUR amount. Returns (response, min_vol)
-    If private API fails, this function will retry (private_post already retries), and if caller still gets exception,
-    it will return (None, min_vol) to indicate failure while providing min_vol info when possible.
-    """
-    # obtain a price (may use cache)
     try:
         price = get_price(pair)
     except Exception as e:
         logger.warning("Cannot determine price for %s to compute volume: %s", pair, e)
-        # try to recover by looking at ordemin only; place minimal volume if side == buy and fiat enough
         try:
             min_vol = get_min_order_volume(pair)
             return None, min_vol
@@ -323,7 +304,6 @@ def place_market_order(pair: str, side: str, eur_amount: float) -> Tuple[Optiona
         logger.warning("Cannot determine ordemin for %s: %s", pair, e)
         min_vol = 0
 
-    # if calculated volume is below min -> try to increase to min if buying and fiat available
     if vol < min_vol:
         if side == "buy":
             needed_eur = price * min_vol
@@ -337,7 +317,6 @@ def place_market_order(pair: str, side: str, eur_amount: float) -> Tuple[Optiona
                 return None, min_vol
             vol = min_vol
         else:
-            # for sell, if below min, refuse
             return None, min_vol
 
     order = {
@@ -353,7 +332,6 @@ def place_market_order(pair: str, side: str, eur_amount: float) -> Tuple[Optiona
         logger.warning("Failed to place order %s %s on %s: %s", side, vol, pair, e)
         return None, min_vol
 
-    # Kraken returns errors in payload as well
     if resp.get('error'):
         logger.warning("AddOrder returned errors: %s", resp.get('error'))
         return None, min_vol
@@ -361,7 +339,6 @@ def place_market_order(pair: str, side: str, eur_amount: float) -> Tuple[Optiona
     return resp, min_vol
 
 # ------------------- Load / Save Last Actions ----------------
-
 def load_last_action():
     if os.path.exists(LAST_ACTION_FILE):
         with open(LAST_ACTION_FILE, "r") as f:
@@ -375,7 +352,6 @@ def load_last_action():
                 return {}
     return {}
 
-
 def save_last_action(actions_dict):
     try:
         with open(LAST_ACTION_FILE, "w") as f:
@@ -384,9 +360,9 @@ def save_last_action(actions_dict):
         logger.warning("Failed to save last_action: %s", e)
 
 # ------------------- Main Loop ---------------------------
-
 def main():
     send_telegram("🤖 Kraken scalping bot (robust) started with profit protection!")
+    send_discord("🤖 Kraken scalping bot (robust) started with profit protection!")
     logger.info("Running scalping bot (ETH+DOGE+XRP, EMA 5/20, profit-protected)...")
     last_action = load_last_action()
 
@@ -395,6 +371,7 @@ def main():
     except Exception as e:
         logger.exception("Error resolving pairs: %s", e)
         send_telegram(f"⚠️ Error resolving pairs: {e}")
+        send_discord(f"⚠️ Error resolving pairs: {e}")
         return
 
     logger.info("Resolved pairs:")
@@ -404,7 +381,6 @@ def main():
     while True:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         try:
-            # fetch balances (private) - wrapped in retry
             balances = get_balance()
             fiat_balance = float(balances.get("Z" + QUOTE, 0) or 0)
             per_asset_balances = {base: float(balances.get(info['base_asset'], 0) or 0)
@@ -412,16 +388,17 @@ def main():
 
             asset_signals = {}
             for base, info in resolved.items():
-                # fetch OHLC; if it fails, we'll attempt to use cached price to make a decision
                 try:
                     df = fetch_ohlc(info['pair'], interval=OHLC_INTERVAL, count=OHLC_COUNT)
                     asset_signals[base] = generate_scalp_signal(df)
                 except Exception as e:
-                    logger.warning("Failed to fetch OHLC for %s: %s (will attempt to trade using cached price if available)", base, e)
-                    # if OHLC is unavailable, don't block trading — fallback: None signal (conservative)
+                    logger.warning("Failed to fetch OHLC for %s: %s", base, e)
                     asset_signals[base] = None
 
-            logger.info("%s | Signals: %s | Fiat: %.2f %s | Balances: %s", timestamp, asset_signals, fiat_balance, QUOTE, per_asset_balances)
+            signal_msg = f"{timestamp} | Signals: {asset_signals} | Fiat: {fiat_balance:.2f} {QUOTE} | Balances: {per_asset_balances}"
+            logger.info(signal_msg)
+            send_discord(signal_msg)
+
             executed_any = False
 
             for base, signal in asset_signals.items():
@@ -444,13 +421,13 @@ def main():
                         msg = f"🚀 BUY {base} executed at {price if price else 'unknown'} {QUOTE}"
                         logger.info("%s | %s %s", timestamp, msg, resp)
                         send_telegram(msg)
+                        send_discord(msg, ping_everyone=True)
                     else:
                         logger.info("%s | Not enough balance for min order (%s %s). Skipping BUY.", timestamp, min_vol, base)
 
-                # SELL — only if profitable
+                # SELL
                 elif signal == 'sell' and last.get('side') == 'buy' and balance > 0:
                     buy_price = last.get('price')
-                    # if buy_price isn't available (e.g. cached or missing), try to use cached or current
                     try:
                         price = get_price(pair)
                     except Exception as e:
@@ -458,7 +435,6 @@ def main():
                         price = None
 
                     if buy_price is None:
-                        # If we don't know buy_price, attempt to sell if price exists and achieves MIN_PROFIT vs cached buy price (not available)
                         logger.info("No stored buy price for %s; attempting conservative sell if price exists", base)
 
                     if price is not None and buy_price is not None:
@@ -473,6 +449,7 @@ def main():
                                 msg = f"💰 SELL {base} executed at {price:.6f} {QUOTE}"
                                 logger.info("%s | %s %s", timestamp, msg, resp)
                                 send_telegram(msg)
+                                send_discord(msg, ping_everyone=True)
                             else:
                                 logger.info("%s | Not enough for min order (%s %s). Skipping SELL.", timestamp, min_vol, base)
                         else:
@@ -487,12 +464,10 @@ def main():
 
         except Exception as e:
             logger.exception("%s | Error in main loop: %s", timestamp, e)
-            # send a compact message to Telegram but avoid spamming
             send_telegram(f"⚠️ Error in main loop: {e}")
+            send_discord(f"⚠️ Error in main loop: {e}")
 
         time.sleep(POLL_INTERVAL)
 
-
 if __name__ == "__main__":
     main()
-
