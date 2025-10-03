@@ -1,14 +1,7 @@
 # kraken_bot.py
 """
-Improved Kraken scalping bot with robust error handling, retry/backoff, and Discord alerts.
-- Retries network/HTTP errors with exponential backoff + jitter
-- Falls back to cached prices when public API temporarily fails (to allow trading)
-- Handles Kraken API "error" payloads gracefully
-- Keeps attempting trades aggressively but safely (respects minimum order volume)
-- Sends Telegram and Discord alerts on failures and trades
-
-Notes:
-- Keep your KRAKEN_API_KEY, KRAKEN_API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, and DISCORD_WEBHOOK in environment or .env
+Kraken scalping bot with multiple buys, average entry, profit-target selling,
+robust error handling, retry/backoff, and Discord/Telegram alerts.
 """
 from dotenv import load_dotenv
 load_dotenv()
@@ -30,49 +23,38 @@ ASSETS = ["ETH", "DOGE", "XRP"]
 QUOTE = "EUR"
 
 TRADE_EUR = 50.0           # Max EUR per trade per coin
-MIN_PROFIT = 0.012         # 1.2% profit target (covers ~0.5% Kraken fees)
+MIN_PROFIT = 0.012         # 1.2% profit target
 
 SHORT_EMA = 5
 LONG_EMA = 20
 OHLC_INTERVAL = 1
 OHLC_COUNT = 200
-
-POLL_INTERVAL = 30         # seconds between checks
+POLL_INTERVAL = 30
 LAST_ACTION_FILE = "last_action.json"
 
+# ---------------- API KEYS ----------------
 API_KEY = os.getenv("KRAKEN_API_KEY")
 API_SECRET = os.getenv("KRAKEN_API_SECRET")
-
-# Telegram
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-# Discord
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 
 API_BASE = "https://api.kraken.com"
-
-# Retry settings
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 1.0
 BACKOFF_FACTOR = 2.0
 JITTER = 0.3
+ALERT_FAILURE_THRESHOLD = 6
 
-# Failure thresholds
-ALERT_FAILURE_THRESHOLD = 6  # consecutive public/private errors before Telegram alert
-
-# Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("kraken_bot")
 
-# In-memory caches
 price_cache = {}
 ordermin_cache = {}
-
 consecutive_public_errors = 0
 consecutive_private_errors = 0
 
-# ------------------- Telegram ----------------------
+# ---------------- TELEGRAM / DISCORD ----------------
 def send_telegram(msg: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -82,7 +64,6 @@ def send_telegram(msg: str):
     except Exception as e:
         logger.warning("⚠️ Telegram send failed: %s", e)
 
-# ------------------- Discord ----------------------
 def send_discord(msg: str, ping_everyone: bool = False):
     if not DISCORD_WEBHOOK:
         return
@@ -92,7 +73,7 @@ def send_discord(msg: str, ping_everyone: bool = False):
     except Exception as e:
         logger.warning("⚠️ Discord send failed: %s", e)
 
-# ------------------- Retry ------------------
+# ---------------- RETRY ----------------
 def _sleep_backoff(attempt: int):
     base = INITIAL_BACKOFF * (BACKOFF_FACTOR ** attempt)
     jitter = base * JITTER
@@ -116,20 +97,19 @@ def request_with_retry(fn, *args, is_private=False, **kwargs):
             _sleep_backoff(attempt)
         except Exception as e:
             last_exc = e
-            logger.exception("Unexpected error during request: %s", e)
+            logger.exception("Unexpected error: %s", e)
             _sleep_backoff(attempt)
-
     if is_private:
         consecutive_private_errors += 1
         if consecutive_private_errors >= ALERT_FAILURE_THRESHOLD:
-            send_telegram(f"⚠️ Kraken private API failing repeatedly ({consecutive_private_errors} errors)")
+            send_telegram(f"⚠️ Kraken private API failing repeatedly ({consecutive_private_errors})")
     else:
         consecutive_public_errors += 1
         if consecutive_public_errors >= ALERT_FAILURE_THRESHOLD:
-            send_telegram(f"⚠️ Kraken public API failing repeatedly ({consecutive_public_errors} errors)")
+            send_telegram(f"⚠️ Kraken public API failing repeatedly ({consecutive_public_errors})")
     raise last_exc
 
-# ------------------- Kraken API ---------------------------
+# ---------------- KRAKEN API ----------------
 def require_keys():
     if not API_KEY or not API_SECRET:
         raise RuntimeError("KRAKEN_API_KEY and KRAKEN_API_SECRET must be set.")
@@ -163,15 +143,13 @@ def private_post(endpoint: str, data: dict) -> dict:
         return r.json()
     return request_with_retry(_fn, is_private=True)
 
-# ------------------- Market Functions ---------------------
+# ---------------- MARKET FUNCTIONS ----------------
 def fetch_ohlc(pair: str, interval=OHLC_INTERVAL, count=OHLC_COUNT) -> pd.DataFrame:
     resp = public_get("OHLC", {"pair": pair, "interval": interval})
     if resp.get("error"):
         raise RuntimeError(f"OHLC error: {resp['error']}")
     result = resp.get("result", {})
     data = next((v for k, v in result.items() if k != "last"), None)
-    if data is None:
-        raise RuntimeError(f"No OHLC data for {pair}")
     df = pd.DataFrame(data, columns=["time","open","high","low","close","vwap","volume","count"])
     df['close'] = df['close'].astype(float)
     return df.tail(count)
@@ -246,24 +224,21 @@ def get_price(pair):
         raise
 
 def place_market_order(pair, side, eur_amount) -> Tuple[Optional[dict], float, str]:
-    """Returns tuple (response, min_vol, fail_reason)."""
     try:
         price = get_price(pair)
     except Exception as e:
         return None, get_min_order_volume(pair), f"Failed to fetch price: {e}"
-
     vol = round(eur_amount / price, 8)
     min_vol = get_min_order_volume(pair)
     if vol < min_vol:
         return None, min_vol, f"Order volume too small: {vol:.8f} < min {min_vol:.8f}"
-
     order = {"ordertype": "market","type": side,"volume": str(vol),"pair": pair}
     resp = private_post("AddOrder", order)
     if resp.get("error"):
         return None, min_vol, f"Kraken API error: {resp['error']}"
     return resp, min_vol, ""
 
-# ------------------- Last Actions ----------------
+# ---------------- LAST ACTIONS ----------------
 def load_last_action():
     if os.path.exists(LAST_ACTION_FILE):
         try:
@@ -280,7 +255,7 @@ def save_last_action(actions):
     except Exception as e:
         logger.warning("Failed to save last_action: %s", e)
 
-# ------------------- Main Loop ---------------------------
+# ---------------- MAIN LOOP ----------------
 def main():
     send_discord("🤖 Kraken scalping bot started with profit protection!")
     logger.info("Running scalping bot...")
@@ -303,7 +278,6 @@ def main():
                     logger.warning("OHLC fail %s: %s", base, e)
                     asset_signals[base] = None
 
-            # Log the cycle
             cycle_msg = f"{timestamp} | Signals: {asset_signals} | Fiat: {fiat_balance:.2f} {QUOTE} | Balances: {per_asset_balances}"
             logger.info(cycle_msg)
             send_discord(cycle_msg, ping_everyone=False)
@@ -315,10 +289,18 @@ def main():
                 balance = per_asset_balances[base]
                 last = last_action.get(base, {})
 
+                if 'buys' not in last:
+                    last['buys'] = []
+
                 # -------- BUY --------
-                if signal == 'buy' and last.get('side') != 'buy':
+                if signal == 'buy':
+                    if len(last['buys']) >= 4:
+                        msg = f"{timestamp} | Skipping BUY {base}: reached max 4 buys"
+                        logger.info(msg)
+                        send_discord(msg)
+                        continue
                     if fiat_balance < 1:
-                        msg = f"{timestamp} | Skipping BUY {base}: not enough fiat ({fiat_balance:.2f} {QUOTE})"
+                        msg = f"{timestamp} | Skipping BUY {base}: insufficient fiat ({fiat_balance:.2f})"
                         logger.info(msg)
                         send_discord(msg)
                         continue
@@ -326,10 +308,11 @@ def main():
                     resp, min_vol, reason = place_market_order(pair, 'buy', eur_amount)
                     if resp:
                         price = get_price(pair)
-                        last_action[base] = {"side": "buy", "price": price}
+                        last['buys'].append(price)
+                        last['avg_price'] = sum(last['buys']) / len(last['buys'])
                         fiat_balance -= eur_amount
                         executed_any = True
-                        msg = f"🚀 BUY {base} at {price:.6f} {QUOTE}"
+                        msg = f"🚀 BUY {base} at {price:.6f} | Avg: {last['avg_price']:.6f} | Buys: {len(last['buys'])}"
                         logger.info("%s | %s", timestamp, msg)
                         send_discord(msg, ping_everyone=True)
                     else:
@@ -338,8 +321,8 @@ def main():
                         send_discord(msg)
 
                 # -------- SELL --------
-                elif signal == 'sell' and last.get('side') == 'buy':
-                    buy_price = last.get('price')
+                elif signal == 'sell' and last.get('buys'):
+                    avg_price = last.get('avg_price')
                     price = None
                     try:
                         price = get_price(pair)
@@ -347,43 +330,36 @@ def main():
                         msg = f"{timestamp} | No price for {base}: {e}"
                         logger.warning(msg)
                         send_discord(msg)
+                        continue
 
                     if balance <= 0:
                         msg = f"{timestamp} | Skipping SELL {base}: balance is zero"
                         logger.info(msg)
                         send_discord(msg)
-                    elif buy_price is None:
-                        msg = f"{timestamp} | Skipping SELL {base}: no stored buy price"
-                        logger.info(msg)
-                        send_discord(msg)
-                    elif price is None:
-                        msg = f"{timestamp} | Skipping SELL {base}: no price available"
-                        logger.info(msg)
-                        send_discord(msg)
-                    else:
-                        target_price = buy_price * (1 + MIN_PROFIT)
-                        if price < buy_price:
-                            msg = f"{timestamp} | Skipping SELL {base}: price {price:.6f} < buy price {buy_price:.6f}"
-                            logger.info(msg)
-                            send_discord(msg)
-                        elif price < target_price:
-                            msg = f"{timestamp} | Skipping SELL {base}: price {price:.6f} < target profit {target_price:.6f}"
-                            logger.info(msg)
-                            send_discord(msg)
+                        continue
+
+                    target_price = avg_price * (1 + MIN_PROFIT)
+                    if price >= target_price:
+                        eur_equivalent = balance * price
+                        eur_amount = min(eur_equivalent, TRADE_EUR * len(last['buys']))
+                        resp, min_vol, reason = place_market_order(pair, 'sell', eur_amount)
+                        if resp:
+                            msg = f"💰 SELL {base} at {price:.6f} | Profit target reached"
+                            logger.info("%s | %s", timestamp, msg)
+                            send_discord(msg, ping_everyone=True)
+                            last['buys'] = []
+                            last['avg_price'] = None
+                            executed_any = True
                         else:
-                            eur_equivalent = balance * price
-                            eur_amount = min(eur_equivalent, TRADE_EUR)
-                            resp, min_vol, reason = place_market_order(pair, 'sell', eur_amount)
-                            if resp:
-                                last_action[base] = {"side": "sell"}
-                                executed_any = True
-                                msg = f"💰 SELL {base} at {price:.6f} {QUOTE}"
-                                logger.info("%s | %s", timestamp, msg)
-                                send_discord(msg, ping_everyone=True)
-                            else:
-                                msg = f"{timestamp} | Skipping SELL {base}: {reason}"
-                                logger.info(msg)
-                                send_discord(msg)
+                            msg = f"{timestamp} | Skipping SELL {base}: {reason}"
+                            logger.info(msg)
+                            send_discord(msg)
+                    else:
+                        msg = f"{timestamp} | HOLD {base}: {price:.6f} < target {target_price:.6f}"
+                        logger.info(msg)
+                        send_discord(msg)
+
+                last_action[base] = last
 
             if executed_any:
                 save_last_action(last_action)
