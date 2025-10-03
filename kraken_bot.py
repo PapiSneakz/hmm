@@ -1,7 +1,7 @@
 # kraken_bot.py
 """
 Kraken scalping bot with multiple buys, average entry, profit-target selling,
-robust error handling, retry/backoff, and Discord/Telegram alerts.
+robust error handling, retry/backoff, Telegram/Discord alerts, and hourly summary.
 """
 from dotenv import load_dotenv
 load_dotenv()
@@ -22,8 +22,8 @@ from typing import Tuple, Optional
 ASSETS = ["ETH", "DOGE", "XRP"]
 QUOTE = "EUR"
 
-TRADE_EUR = 50.0           # Max EUR per trade per coin
-MIN_PROFIT = 0.012         # 1.2% profit target
+TRADE_EUR = 50.0
+MIN_PROFIT = 0.012
 
 SHORT_EMA = 5
 LONG_EMA = 20
@@ -31,6 +31,8 @@ OHLC_INTERVAL = 1
 OHLC_COUNT = 200
 POLL_INTERVAL = 30
 LAST_ACTION_FILE = "last_action.json"
+
+SUMMARY_INTERVAL = 3600  # 1 hour in seconds
 
 # ---------------- API KEYS ----------------
 API_KEY = os.getenv("KRAKEN_API_KEY")
@@ -257,10 +259,11 @@ def save_last_action(actions):
 
 # ---------------- MAIN LOOP ----------------
 def main():
-    send_discord("🤖 Kraken scalping bot started with profit protection!")
+    send_discord("🤖 Kraken scalping bot started with profit protection!", ping_everyone=True)
     logger.info("Running scalping bot...")
     last_action = load_last_action()
     resolved = resolve_pairs(ASSETS, QUOTE)
+    last_summary_time = time.time()
 
     while True:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -288,11 +291,10 @@ def main():
                 pair = resolved[base]['pair']
                 balance = per_asset_balances[base]
                 last = last_action.get(base, {})
-
                 if 'buys' not in last:
                     last['buys'] = []
 
-                # -------- BUY --------
+                # BUY LOGIC
                 if signal == 'buy':
                     if len(last['buys']) >= 4:
                         msg = f"{timestamp} | Skipping BUY {base}: reached max 4 buys"
@@ -313,17 +315,16 @@ def main():
                         fiat_balance -= eur_amount
                         executed_any = True
                         msg = f"🚀 BUY {base} at {price:.6f} | Avg: {last['avg_price']:.6f} | Buys: {len(last['buys'])}"
-                        logger.info("%s | %s", timestamp, msg)
+                        logger.info(msg)
                         send_discord(msg, ping_everyone=True)
                     else:
                         msg = f"{timestamp} | Skipping BUY {base}: {reason}"
                         logger.info(msg)
                         send_discord(msg)
 
-                # -------- SELL --------
+                # SELL LOGIC
                 elif signal == 'sell' and last.get('buys'):
                     avg_price = last.get('avg_price')
-                    price = None
                     try:
                         price = get_price(pair)
                     except Exception as e:
@@ -333,11 +334,7 @@ def main():
                         continue
 
                     if balance <= 0:
-                        msg = f"{timestamp} | Skipping SELL {base}: balance is zero"
-                        logger.info(msg)
-                        send_discord(msg)
                         continue
-
                     target_price = avg_price * (1 + MIN_PROFIT)
                     if price >= target_price:
                         eur_equivalent = balance * price
@@ -345,7 +342,7 @@ def main():
                         resp, min_vol, reason = place_market_order(pair, 'sell', eur_amount)
                         if resp:
                             msg = f"💰 SELL {base} at {price:.6f} | Profit target reached"
-                            logger.info("%s | %s", timestamp, msg)
+                            logger.info(msg)
                             send_discord(msg, ping_everyone=True)
                             last['buys'] = []
                             last['avg_price'] = None
@@ -354,19 +351,21 @@ def main():
                             msg = f"{timestamp} | Skipping SELL {base}: {reason}"
                             logger.info(msg)
                             send_discord(msg)
-                    else:
-                        msg = f"{timestamp} | HOLD {base}: {price:.6f} < target {target_price:.6f}"
-                        logger.info(msg)
-                        send_discord(msg)
 
                 last_action[base] = last
 
+            # Hourly summary
+            if time.time() - last_summary_time >= SUMMARY_INTERVAL:
+                summary_msg = f"⏱ Hourly Summary | Fiat: {fiat_balance:.2f} {QUOTE}\n"
+                for base, info in last_action.items():
+                    buys = info.get('buys', [])
+                    avg = info.get('avg_price')
+                    summary_msg += f"{base}: {len(buys)} open buys, avg entry {avg if avg else '-'}\n"
+                send_discord(summary_msg.strip(), ping_everyone=True)
+                last_summary_time = time.time()
+
             if executed_any:
                 save_last_action(last_action)
-            else:
-                msg = f"{timestamp} | No trades executed."
-                logger.info(msg)
-                send_discord(msg)
 
         except Exception as e:
             logger.exception("%s | Error in main loop: %s", timestamp, e)
